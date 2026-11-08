@@ -37,8 +37,11 @@ jobs:
             echo "go=false" >> "$GITHUB_OUTPUT"
           fi
 
-  # 五个分片并行：sz 主板 / sz 创业板 / sh 主板 / sh 科创 / 北交所
-  # 单片 1100-1700 只，墙钟时间从「最慢的一个市场」降到「最慢的一个板块」
+  # 三个市场并行（sz / sh / bj）。
+  # 试过再细分成 5 片（sz 主板/创业板、sh 主板/科创），实测**没有更快**：
+  # 瓶颈是通达信单节点的请求容量，不是 GitHub 的 CPU，分得越细只能排队跑，
+  # 五片（最多同时 2 片）实测 7.7 分钟，三片齐发 3.5 分钟。要细分就用
+  # `--prefix` 在本地跑（见 pipeline.py 的 --prefix 参数）。
   shard:
     needs: guard
     if: needs.guard.outputs.go == 'true' || github.event_name == 'workflow_dispatch'
@@ -46,21 +49,8 @@ jobs:
     timeout-minutes: 15
     strategy:
       fail-fast: false
-      # 最多同时跑 2 片：五片一起连同一个通达信节点会把 7709 命令通道挤断，
-      # 单片反而变慢（实测 5 片齐发时 sh 主板的耗时翻三倍）。
-      max-parallel: 2
       matrix:
-        include:
-          - market: sz
-            prefix: "000,001,002,003"
-          - market: sz
-            prefix: "300,301"
-          - market: sh
-            prefix: "600,601,603,605"
-          - market: sh
-            prefix: "688,689"
-          - market: bj
-            prefix: ""
+        market: [sz, sh, bj]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -68,20 +58,20 @@ jobs:
           python-version: "3.11"
           cache: pip
       - run: python -m pip install -q -r requirements.txt
-      - name: 抓取 ${{ matrix.market }} ${{ matrix.prefix }}
+      - name: 抓取 ${{ matrix.market }}
         env:
-          # 五个分片同时对同一个通达信节点，单个 shard 的并发要压下来，
-          # 否则容易把命令通道挤断（ConnectionClosedError: runtime command channel is closed）
-          QUOTE_WORKERS: "7"
-          DERIVE_WORKERS: "5"
-          POOL_SIZE: "10"
+          # 三个分片同时对同一个通达信节点，单个 shard 的并发要压下来，
+          # 否则容易把命令通道挤断（ConnectionClosedError: runtime command channel is closed）；
+          # 挤断了 HealingClient 会自动重建连接重试，不会整片报废。
+          QUOTE_WORKERS: "8"
+          DERIVE_WORKERS: "6"
+          POOL_SIZE: "16"
           SERVER_COUNT: "2"
         run: |
-          python pipeline.py --markets "${{ matrix.market }}" --prefix "${{ matrix.prefix }}" \
-                             --shard --out-dir shard
+          python pipeline.py --markets "${{ matrix.market }}" --shard --out-dir shard
       - uses: actions/upload-artifact@v4
         with:
-          name: shard-${{ matrix.market }}-${{ strategy.job-index }}
+          name: shard-${{ matrix.market }}
           path: shard
           retention-days: 1
 
