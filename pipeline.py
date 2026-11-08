@@ -31,10 +31,11 @@ from pathlib import Path
 CHUNK = 80                    # 通达信单次快照上限，80 只/次
 BAR_CHUNK = 300               # 日 K 每批代码数（一批＝一个请求；19 批并发跑完）
 FLOW_CHUNK = 300              # 资金流每批代码数（一批＝一个请求，比库默认的 75 少 4 倍往返）
-QUOTE_WORKERS = 10            # 快照并发（Actions 上是延迟受限，加并发直接换算成时间）
-DERIVE_WORKERS = 10           # 日 K / 资金流并发
-SERVER_COUNT = 4              # 服务器数（多了反而抢容量，实测 4 最稳）
-POOL_SIZE = 32                # 连接池（复用建连，省掉每次握手）
+QUOTE_WORKERS = int(os.environ.get("QUOTE_WORKERS", "10"))   # 快照并发（Actions 上延迟受限）
+DERIVE_WORKERS = int(os.environ.get("DERIVE_WORKERS", "10"))  # 日 K / 资金流并发
+SERVER_COUNT = int(os.environ.get("SERVER_COUNT", "4"))       # 服务器数（多了反而抢容量，实测 4 最稳）
+POOL_SIZE = int(os.environ.get("POOL_SIZE", "32"))            # 连接池（复用建连，省掉每次握手）
+FLOW_RETRY_CHUNK = 60         # 资金流重试批大小（通道重建后先用小批试探）
 RETRY = 3                     # 单批失败重试次数（PoolBusy / 瞬时断连）
 MIN_COVERAGE = 0.90           # 快照覆盖率低于此值视为异常，整轮不发布
 STAGE_DIR = ".staging"        # 暂存目录：全部产出先写这里，闸门通过才原子替换
@@ -239,29 +240,84 @@ def fetch_daily(client, codes: list[str], count: int = 250, workers: int = DERIV
     return merged
 
 
-def fetch_main_net(client, codes: list[str], workers: int = DERIVE_WORKERS) -> dict[str, float]:
-    """当日主力净流入（万元）。取 money_flow 最新一条记录的 main_net。"""
+def fetch_main_net(client, codes: list[str], workers: int = DERIVE_WORKERS, factory=None):
+    """当日主力净流入（万元）。取 money_flow 最新一条记录的 main_net。
+
+    通达信的 runtime 偶发会整条命令通道关闭（ConnectionClosedError: 7709 runtime
+    command channel is closed），这时所有批次会同时失败。检测到"几乎全灭"就重建
+    客户端、把失败批次拆小重试一次；重建出的客户端会返回给调用方继续用。
+
+    返回 (净流入字典, 当前可用客户端)。
+    """
+
+    def work_with(cl):
+        def work(chunk: list[str]) -> dict[str, float]:
+            batch = cl.money_flow.daily(chunk, batch_size=len(chunk))
+            res: dict[str, float] = {}
+            for block in batch.blocks:
+                recs = [r for r in (block.records or ()) if r.date]
+                if not recs:
+                    continue
+                latest = max(recs, key=lambda r: r.date)
+                # 北交所等部分标的没有资金流数据，total_amount 为 0 时留空（前端显示 —），不要写成 0 亿
+                if not float(latest.total_amount or 0):
+                    continue
+                res[f"{block.exchange}{block.code}"] = round(float(latest.main_net or 0) / 1e4, 1)
+            return res
+        return work
+
+    def run(cl, chunks):
+        """跑一批分片，返回 (结果, 失败分片列表)。"""
+        got: dict[str, float] = {}
+        failed: list[list[str]] = []
+        lock = threading.Lock()
+        work = work_with(cl)
+
+        def one(chunk):
+            try:
+                part = _retry(lambda: work(chunk))
+            except Exception as exc:
+                log(f"[!] 资金流失败（{len(chunk)} 只）：{type(exc).__name__}: {exc}")
+                with lock:
+                    failed.append(chunk)
+                return
+            with lock:
+                got.update(part)
+
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            list(pool.map(one, chunks))
+        return got, failed
+
     chunks = [codes[i:i + FLOW_CHUNK] for i in range(0, len(codes), FLOW_CHUNK)]
+    merged, failed = run(client, chunks)
 
-    def work(chunk: list[str]) -> dict[str, float]:
-        batch = client.money_flow.daily(chunk, batch_size=len(chunk))
-        res: dict[str, float] = {}
-        for block in batch.blocks:
-            recs = [r for r in (block.records or ()) if r.date]
-            if not recs:
-                continue
-            latest = max(recs, key=lambda r: r.date)
-            # 北交所等部分标的没有资金流数据，total_amount 为 0 时留空（前端显示 —），不要写成 0 亿
-            if not float(latest.total_amount or 0):
-                continue
-            res[f"{block.exchange}{block.code}"] = round(float(latest.main_net or 0) / 1e4, 1)
-        return res
+    # 全军覆没（或大面积失败）通常是命令通道挂了，换一条新连接再试一次
+    if failed and factory and len(merged) < 0.5 * len(codes):
+        log(f"[!] 资金流整体异常（{len(merged)}/{len(codes)}），新建连接后重试 {len(failed)} 批")
+        try:
+            fresh = factory()
+        except Exception as exc:
+            log(f"[!] 重建连接失败：{type(exc).__name__}: {exc}")
+        else:
+            smaller = [c[i:i + FLOW_RETRY_CHUNK]
+                       for c in failed for i in range(0, len(c), FLOW_RETRY_CHUNK)]
+            retry_got, still = run(fresh, smaller)
+            merged.update(retry_got)
+            log(f"[*] 重试后补充 {len(retry_got)} 只，仍失败 {len(still)} 批")
+            if len(merged) >= 0.5 * len(codes):
+                old, client = client, fresh          # 老连接已废，后面改用新连接
+                try:
+                    old.close()
+                except Exception:
+                    pass
+            else:
+                try:
+                    fresh.close()
+                except Exception:
+                    pass
 
-    merged: dict[str, float] = {}
-    for part in _parallel(work, chunks, workers, "资金流"):
-        merged.update(part)
     log(f"[*] 资金流：{len(chunks)} 批 → {len(merged)} 只有主力净流入")
-    return merged
+    return merged, client
 
 
 def fetch_circulating(client, codes: list[str]) -> dict[str, float]:
@@ -416,7 +472,8 @@ FIELDS = {
 }
 
 
-def fetch_all(client, out_dir: Path, args, now_cn, version: str, started: float) -> int:
+def fetch_all(client, out_dir: Path, args, now_cn, version: str, started: float,
+              factory=None) -> int:
     stage = out_dir / STAGE_DIR
     shutil.rmtree(stage, ignore_errors=True)
     stage.mkdir(parents=True, exist_ok=True)
@@ -444,7 +501,7 @@ def fetch_all(client, out_dir: Path, args, now_cn, version: str, started: float)
         names, names_fresh = load_names(client, out_dir)
         daily = fetch_daily(client, list(snap), workers=args.workers)
         stats["daily_ok"] = len(daily)
-        main_net = fetch_main_net(client, list(snap), workers=args.workers)
+        main_net, client = fetch_main_net(client, list(snap), workers=args.workers, factory=factory)
         circulating = fetch_circulating(client, list(snap))
         signals = build_signals(snap, daily, main_net, circulating, names)
         stats["signals_ok"] = len(signals)
@@ -571,12 +628,15 @@ def main() -> int:
         version = getattr(eltdx, "__version__", "?")
     log(f"=== signal-data {now_cn:%Y-%m-%d %H:%M} (eltdx {version}) ===")
 
-    client = TdxClient(timeout=args.timeout, probe_hosts=True,
-                       server_count=SERVER_COUNT, pool_size=POOL_SIZE)
+    def make_client():
+        return TdxClient(timeout=args.timeout, probe_hosts=True,
+                         server_count=SERVER_COUNT, pool_size=POOL_SIZE)
+
+    client = make_client()
     try:
         if args.merge:
             return merge_shards(Path(args.merge), out_dir, client, args, now_cn, version, started)
-        return fetch_all(client, out_dir, args, now_cn, version, started)
+        return fetch_all(client, out_dir, args, now_cn, version, started, factory=make_client)
     finally:
         try:
             client.close()

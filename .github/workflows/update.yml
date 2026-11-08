@@ -55,6 +55,13 @@ jobs:
           cache: pip
       - run: python -m pip install -q -r requirements.txt
       - name: 抓取 ${{ matrix.market }} 市场
+        env:
+          # 三个分片同时对同一个通达信节点，单个 shard 的并发要压下来，
+          # 否则容易把命令通道挤断（ConnectionClosedError: runtime command channel is closed）
+          QUOTE_WORKERS: "8"
+          DERIVE_WORKERS: "6"
+          POOL_SIZE: "16"
+          SERVER_COUNT: "2"
         run: python pipeline.py --markets ${{ matrix.market }} --shard --out-dir shard
       - uses: actions/upload-artifact@v4
         with:
