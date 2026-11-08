@@ -40,6 +40,8 @@ RETRY = 3                     # 单批失败重试次数（PoolBusy / 瞬时断�
 MIN_COVERAGE = 0.90           # 快照覆盖率低于此值视为异常，整轮不发布
 STAGE_DIR = ".staging"        # 暂存目录：全部产出先写这里，闸门通过才原子替换
 NAMES_CACHE = "names.json"    # 股票名称缓存（名称一天只变几只）
+HISTORY = "history.json"      # 每日一行留档：指数点位、涨跌家数、异动榜数量
+HISTORY_MAX = 250             # 保留最近 250 个交易日（约 60KB）
 NAMES_TTL_DAYS = 3
 MARKETS = ("sz", "sh", "bj")
 INDICES = (
@@ -491,6 +493,40 @@ def _write_json(path: Path, obj, *, indent=None) -> None:
     path.write_text(text, encoding="utf-8")
 
 
+def append_history(out_dir: Path, at: str, px: dict, signals: dict, items: list,
+                   mom: dict | None) -> dict:
+    """把当天的市场概况追加进 out/history.json（同一天重复跑就覆盖当天那行）。
+
+    只存"以后想回看才有用"的聚合值，一天一行（约 250 字节），一年不到 100KB。
+    """
+    path = out_dir / HISTORY
+    rows: list[dict] = []
+    if path.exists():
+        try:
+            rows = (json.loads(path.read_text(encoding="utf-8")) or {}).get("rows") or []
+        except Exception:
+            rows = []
+    up = sum(1 for v in px.values() if (v[1] or 0) > 0)
+    down = sum(1 for v in px.values() if (v[1] or 0) < 0)
+    chgs = [v[1] for v in px.values() if v[1] is not None]
+    row = {
+        "d": at[:10],
+        "at": at,
+        "n": len(px),
+        "up": up,
+        "down": down,
+        "flat": len(px) - up - down,
+        "avg": round(sum(chgs) / len(chgs), 2) if chgs else None,
+        "idx": {i["name"]: i.get("last") for i in (items or [])},
+        "mom": {g["key"]: g["count"] for g in (mom or {}).get("groups", [])},
+        "flow_ok": sum(1 for v in signals.values() if v.get("mn") is not None),
+    }
+    rows = [r for r in rows if r.get("d") != row["d"]] + [row]
+    rows.sort(key=lambda r: r.get("d") or "")
+    rows = rows[-HISTORY_MAX:]
+    return {"updated": at, "rows": rows}
+
+
 def publish(stage: Path, out_dir: Path) -> list[str]:
     """把暂存目录里的文件原子替换到 out_dir（os.replace 同盘原子，前端不会读到半个文件）。"""
     done = []
@@ -643,6 +679,7 @@ def fetch_all(client, out_dir: Path, args, now_cn, version: str, started: float,
             _write_json(stage / "live-core.json", {"updated": at, "at": at, "px": px,
                                                    "momentum": mom, "indices": items,
                                                    "stocks_ok": len(signals)})
+        _write_json(stage / HISTORY, append_history(out_dir, at, px, signals, items, mom), indent=1)
         if items:
             _write_json(stage / "indices.json", {"updated": at, "items": items}, indent=1)
 
@@ -683,6 +720,7 @@ def merge_shards(shard_dir: Path, out_dir: Path, client, args, now_cn, version: 
         _write_json(stage / "live-core.json", {"updated": at, "at": at, "px": px,
                                                "momentum": mom, "indices": items,
                                                "stocks_ok": len(stocks)})
+        _write_json(stage / HISTORY, append_history(out_dir, at, px, stocks, items, mom), indent=1)
     if items:
         _write_json(stage / "indices.json", {"updated": at, "items": items}, indent=1)
     if names:

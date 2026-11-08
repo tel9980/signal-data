@@ -18,9 +18,11 @@ eltdx（数据源，别人的库）  →  本仓库 pipeline.py  →  out/*.json
 | `out/indices.json` | 上证 / 创业板 / 科创50 / 北证50 的涨跌幅 + 距近一年高点 | 可作为 `signal/data/market.json` 里 `indices` 的来源 |
 | `out/signals.json` | 逐股行情派生指标：5/20/60 日涨幅、距 250 日高·低点、量比、换手率、主力净流入 | signal 没有，属新增 |
 | `out/momentum.json` | 由 `signals.json` 派生的 4 组「异动榜」（含与 signal 同口径的「季末拉升」） | signal 没有，属新增 |
-| `out/live.json` | **首屏单文件**：px + signals + momentum + indices 打包在一起，前端一次请求拿全 | signal 没有，属新增 |
+| `out/live.json` | **整包**：px + signals + momentum + indices 打包在一起，前端一次请求拿全 | signal 没有，属新增 |
+| `out/live-core.json` | **首屏轻包**：px + indices + momentum（不含逐只明细），约 146KB，手机首屏用这个 | signal 没有，属新增 |
 | `out/names.json` | 代码 → 名称缓存（3 天有效，避免每次都拉证券列表） | — |
 | `out/stats.json` | 本次抓取自检：时间、耗时、股票数、指数数、各组数量、**闸门结论**、eltdx 版本 | — |
+| `out/history.json` | **每日一行留档**（最多 250 个交易日）：指数点位、涨跌家数、平均涨幅、异动榜数量、有资金流的只数 | — |
 
 ### px.json
 
@@ -149,3 +151,14 @@ python pipeline.py --out-dir /tmp/x # 指定输出目录
 ## 免责
 
 eltdx 为 Research-Only 许可，本项目仅用于个人学习与协议研究，请勿用于商业或付费服务。
+
+## 测试
+
+```bash
+python -m pip install pytest
+python -m pytest -q tests        # 17 个用例，全程离线，不需要 eltdx
+```
+
+CI 见 `.github/workflows/test.yml`：只改 `pipeline.py` / `tests/` / `scripts/` 时才触发，每天的数据滚动提交不会反复跑。
+锁住的是「改错就让线上出事」的那几块：数据闸门（覆盖率不足不许发布）、分片合并、异动榜规则、断线自愈、每日留档。
+
