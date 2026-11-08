@@ -37,7 +37,8 @@ jobs:
             echo "go=false" >> "$GITHUB_OUTPUT"
           fi
 
-  # 三个市场并行：sz / sh / bj 各跑一个 runner（不同 IP，互不抢通达信容量）
+  # 五个分片并行：sz 主板 / sz 创业板 / sh 主板 / sh 科创 / 北交所
+  # 单片 1100-1700 只，墙钟时间从「最慢的一个市场」降到「最慢的一个板块」
   shard:
     needs: guard
     if: needs.guard.outputs.go == 'true' || github.event_name == 'workflow_dispatch'
@@ -46,7 +47,17 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        market: [sz, sh, bj]
+        include:
+          - market: sz
+            prefix: "000,001,002,003"
+          - market: sz
+            prefix: "300,301"
+          - market: sh
+            prefix: "600,601,603,605"
+          - market: sh
+            prefix: "688,689"
+          - market: bj
+            prefix: ""
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -54,18 +65,20 @@ jobs:
           python-version: "3.11"
           cache: pip
       - run: python -m pip install -q -r requirements.txt
-      - name: 抓取 ${{ matrix.market }} 市场
+      - name: 抓取 ${{ matrix.market }} ${{ matrix.prefix }}
         env:
-          # 三个分片同时对同一个通达信节点，单个 shard 的并发要压下来，
+          # 五个分片同时对同一个通达信节点，单个 shard 的并发要压下来，
           # 否则容易把命令通道挤断（ConnectionClosedError: runtime command channel is closed）
           QUOTE_WORKERS: "8"
           DERIVE_WORKERS: "6"
           POOL_SIZE: "16"
           SERVER_COUNT: "2"
-        run: python pipeline.py --markets ${{ matrix.market }} --shard --out-dir shard
+        run: |
+          python pipeline.py --markets "${{ matrix.market }}" --prefix "${{ matrix.prefix }}" \
+                             --shard --out-dir shard
       - uses: actions/upload-artifact@v4
         with:
-          name: shard-${{ matrix.market }}
+          name: shard-${{ matrix.market }}-${{ strategy.job-index }}
           path: shard
           retention-days: 1
 
@@ -100,25 +113,32 @@ jobs:
         run: python pipeline.py --merge shard --out-dir out
 
       - name: Commit (rolling)
-        run: |
-          git config user.name "actions-user"
-          git config user.email "actions@github.com"
+        run: bash scripts/commit_data.sh
 
-          # 闸门未通过时 pipeline 已 exit 3，走不到这里；保险起见再校验一次
-          python3 -c "import json;d=json.load(open('out/stats.json'));assert d['gate']['ok'], d['gate']"
+  # 兜底：任一分片失败（通达信抖动）就退回单机全量再跑一次，
+  # 宁可慢 3 分钟，也不要整轮没有数据。
+  fallback:
+    needs: [guard, shard]
+    if: needs.shard.result == 'failure' && needs.guard.outputs.go == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-          git add -A out
-          if git diff --cached --quiet; then
-            echo "输出无变化，跳过提交"
-            exit 0
-          fi
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
 
-          MSG="chore: 行情数据更新 $(date -u +%FT%TZ)"
-          LAST=$(git log -1 --pretty=%s)
-          if [ "${LAST#chore: 行情数据更新}" != "$LAST" ]; then
-            git commit -q --amend -m "$MSG"     # 上一次就是滚动提交 → 原地覆盖，历史不增长
-          else
-            git commit -q -m "$MSG"
-          fi
+      - name: Install eltdx
+        run: python -m pip install -q -r requirements.txt
 
-          git push --force origin HEAD:main
+      - name: 单机全量兜底
+        run: python pipeline.py --out-dir out
+
+      - name: Commit (rolling)
+        run: bash scripts/commit_data.sh

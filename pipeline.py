@@ -95,14 +95,21 @@ def _parallel(fn, chunks, workers, label=""):
     return out
 
 
-def fetch_universe(client, limit: int, markets: tuple[str, ...] | list[str] = MARKETS) -> list[str]:
-    """取 A 股代码，统一成 sz000001 / sh600000 / bj430047 这种带前缀的形式。"""
+def fetch_universe(client, limit: int, markets: tuple[str, ...] | list[str] = MARKETS,
+                   prefixes: tuple[str, ...] = ()) -> list[str]:
+    """取 A 股代码，统一成 sz000001 / sh600000 / bj430047 这种带前缀的形式。
+
+    prefixes 不为空时按 6 位代码前缀过滤（如创业板 300/301、科创 688），用于把
+    一个市场拆成多个分片并行跑，单片更小、总时长由最慢的一片决定。
+    """
     codes: list[str] = []
     for market in markets:
         try:
             rows = client.codes.a_shares(market)
             got = [f"{market}{s.code}" for s in rows]
-            log(f"[*] {market} 市场 {len(got)} 只")
+            if prefixes:
+                got = [c for c in got if c[2:5] in prefixes]
+            log(f"[*] {market} 市场 {len(got)} 只" + (f"（前缀 {','.join(prefixes)}）" if prefixes else ""))
             codes.extend(got)
         except Exception as exc:              # 单个市场失败不影响整体
             log(f"[!] {market} 市场取列表失败：{type(exc).__name__}: {exc}")
@@ -480,9 +487,12 @@ def fetch_all(client, out_dir: Path, args, now_cn, version: str, started: float,
     stats = {"generated_at_utc": now_cn.astimezone(timezone.utc).isoformat(timespec="seconds"),
              "eltdx_version": str(version)}
     markets = [m.strip() for m in args.markets.split(",") if m.strip()]
+    prefixes = tuple(p.strip() for p in (args.prefix or "").split(",") if p.strip())
     stats["markets"] = markets
+    if prefixes:
+        stats["prefixes"] = list(prefixes)
 
-    codes = fetch_universe(client, args.limit, markets=markets)
+    codes = fetch_universe(client, args.limit, markets=markets, prefixes=prefixes)
     if not codes:
         log("[x] 没有取到股票列表，退出")
         return 1
@@ -522,9 +532,10 @@ def fetch_all(client, out_dir: Path, args, now_cn, version: str, started: float,
                      "names": names})
 
     if args.shard:
-        name = "-".join(markets) + ".json"
-        _write_json(stage / name, {"at": at, "markets": markets, "px": px,
-                                   "stocks": signals, "names": names})
+        # 分片文件名必须唯一：sz 市场拆成两个分片时不能都叫 sz.json（合并时会互相覆盖）
+        name = "-".join(markets + list(prefixes)) + ".json"
+        _write_json(stage / name, {"at": at, "markets": markets, "prefixes": list(prefixes),
+                                   "px": px, "stocks": signals, "names": names})
         log(f"[+] 分片 {name}：{len(px)} 只现价 / {len(signals)} 只指标")
     else:
         _write_json(stage / "px.json", {"at": at, "px": px})
@@ -603,8 +614,10 @@ def main() -> int:
     ap.add_argument("--min-coverage", type=float, default=MIN_COVERAGE,
                     help="快照覆盖率下限，低于此值本轮不发布（默认 0.9）")
     ap.add_argument("--markets", default=",".join(MARKETS), help="只抓指定市场，如 sz,sh")
+    ap.add_argument("--prefix", default="", metavar="PREFIX",
+                    help="只抓指定代码前缀（逗号分隔，如 300,301=创业板；688=科创），用于细分分片")
     ap.add_argument("--shard", action="store_true",
-                    help="分片模式：按市场各写一个 <market>.json（配合 matrix 并行）")
+                    help="分片模式：按市场（+前缀）各写一个 <market>[-<prefix>].json（配合 matrix 并行）")
     ap.add_argument("--merge", default="", metavar="DIR",
                     help="合并模式：把 DIR/*.json 分片合并成最终产出")
     ap.add_argument("--keep-partial", action="store_true", help="闸门未通过时保留暂存文件便于排查")
