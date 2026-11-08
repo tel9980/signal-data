@@ -639,6 +639,10 @@ def fetch_all(client, out_dir: Path, args, now_cn, version: str, started: float,
             _write_json(stage / "live.json", {"updated": at, "at": at, "px": px,
                                               "stocks": signals, "momentum": mom,
                                               "indices": items})
+            # 首屏轻包：不带逐只明细（stocks 占 78% 体积），手机首屏从 914KB 降到约 125KB
+            _write_json(stage / "live-core.json", {"updated": at, "at": at, "px": px,
+                                                   "momentum": mom, "indices": items,
+                                                   "stocks_ok": len(signals)})
         if items:
             _write_json(stage / "indices.json", {"updated": at, "items": items}, indent=1)
 
@@ -676,6 +680,9 @@ def merge_shards(shard_dir: Path, out_dir: Path, client, args, now_cn, version: 
         _write_json(stage / "momentum.json", mom, indent=1)
         _write_json(stage / "live.json", {"updated": at, "at": at, "px": px,
                                           "stocks": stocks, "momentum": mom, "indices": items})
+        _write_json(stage / "live-core.json", {"updated": at, "at": at, "px": px,
+                                               "momentum": mom, "indices": items,
+                                               "stocks_ok": len(stocks)})
     if items:
         _write_json(stage / "indices.json", {"updated": at, "items": items}, indent=1)
     if names:
