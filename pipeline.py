@@ -27,8 +27,8 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 CHUNK = 80                    # 通达信单次快照上限，80 只/次
-BAR_CHUNK = 300               # 日 K 每批代码数（300 只 × 250 根 ≈ 1.3 秒）
-FLOW_CHUNK = 75               # money_flow 每批代码数（库默认 batch_size=75）
+BAR_CHUNK = 300               # 日 K 每批代码数（一批＝一个请求；19 批并发跑完）
+FLOW_CHUNK = 300              # 资金流每批代码数（一批＝一个请求，比库默认的 75 少 4 倍往返）
 MARKETS = ("sz", "sh", "bj")
 INDICES = (
     ("上证指数", "sh000001"),
@@ -96,7 +96,7 @@ def fetch_names(client) -> dict[str, str]:
         return {}
 
 
-def fetch_quotes(client, codes: list[str], workers: int = 8) -> dict[str, dict]:
+def fetch_quotes(client, codes: list[str], workers: int = 10) -> dict[str, dict]:
     """并发抓快照，返回 {code: {last, chg, hand, amount, high, low, open}}；
     停牌/无成交（价格为 0）的直接丢弃。"""
     chunks = [codes[i:i + CHUNK] for i in range(0, len(codes), CHUNK)]
@@ -166,7 +166,7 @@ def fetch_indices(client) -> list[dict]:
 
 # ---------------------------------------------------------------- 派生指标 ----
 
-def fetch_daily(client, codes: list[str], count: int = 250, workers: int = 6) -> dict[str, dict]:
+def fetch_daily(client, codes: list[str], count: int = 250, workers: int = 8) -> dict[str, dict]:
     """日 K → 各周期涨幅、距 250 日高/低点、量比。返回 {code: {...}}。
 
     口径：
@@ -178,7 +178,7 @@ def fetch_daily(client, codes: list[str], count: int = 250, workers: int = 6) ->
     chunks = [codes[i:i + BAR_CHUNK] for i in range(0, len(codes), BAR_CHUNK)]
 
     def work(chunk: list[str]) -> dict[str, dict]:
-        got = client.bars.get(chunk, period="day", count=count, adjust=None)
+        got = client.bars.get(chunk, period="day", count=count, adjust=None, batch_size=len(chunk))
         # 传 list 时返回的是 {code: KlineSeries} 的 dict，不是 list
         items = got.items() if isinstance(got, dict) else [(s.code, s) for s in got]
         res: dict[str, dict] = {}
@@ -215,12 +215,12 @@ def fetch_daily(client, codes: list[str], count: int = 250, workers: int = 6) ->
     return merged
 
 
-def fetch_main_net(client, codes: list[str], workers: int = 6) -> dict[str, float]:
+def fetch_main_net(client, codes: list[str], workers: int = 8) -> dict[str, float]:
     """当日主力净流入（万元）。取 money_flow 最新一条记录的 main_net。"""
     chunks = [codes[i:i + FLOW_CHUNK] for i in range(0, len(codes), FLOW_CHUNK)]
 
     def work(chunk: list[str]) -> dict[str, float]:
-        batch = client.money_flow.daily(chunk)
+        batch = client.money_flow.daily(chunk, batch_size=len(chunk))
         res: dict[str, float] = {}
         for block in batch.blocks:
             recs = [r for r in (block.records or ()) if r.date]
@@ -329,7 +329,7 @@ def main() -> int:
         version = getattr(eltdx, "__version__", "?")
     log(f"=== signal-data {now_cn:%Y-%m-%d %H:%M} (eltdx {version}) ===")
 
-    client = TdxClient(timeout=args.timeout, probe_hosts=True, server_count=4)
+    client = TdxClient(timeout=args.timeout, probe_hosts=True, server_count=4, pool_size=16)
     stats = {"generated_at_utc": now_cn.astimezone(timezone.utc).isoformat(timespec="seconds"),
              "eltdx_version": str(version)}
     try:
