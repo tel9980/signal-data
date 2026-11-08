@@ -582,6 +582,7 @@ def merge_shards(shard_dir: Path, out_dir: Path, client, args, now_cn, version: 
 
     stats = {"generated_at_utc": now_cn.astimezone(timezone.utc).isoformat(timespec="seconds"),
              "eltdx_version": str(version), "mode": "merge", "shards": len(files),
+             "markets": [f.stem for f in files], "at": at,
              "universe": len(px), "quotes_ok": len(px),
              "signals_ok": len(stocks), "daily_ok": len(stocks),
              "flow_ok": sum(1 for v in stocks.values() if v.get("mn") is not None),
