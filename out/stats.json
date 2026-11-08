@@ -1,13 +1,21 @@
 {
- "generated_at_utc": "2026-11-08T02:25:26+00:00",
+ "generated_at_utc": "2026-11-08T03:19:02+00:00",
  "eltdx_version": "3.3.5",
  "mode": "merge",
- "shards": 3,
- "universe": 5575,
- "quotes_ok": 5575,
- "signals_ok": 5575,
- "daily_ok": 5575,
- "flow_ok": 5217,
+ "shards": 5,
+ "markets": [
+  "bj",
+  "sh-600-601-603-605",
+  "sh-688-689",
+  "sz-000-001-002-003",
+  "sz-300-301"
+ ],
+ "at": "2026-11-08 11:12",
+ "universe": 5574,
+ "quotes_ok": 5574,
+ "signals_ok": 5574,
+ "daily_ok": 5574,
+ "flow_ok": 5216,
  "indices_ok": 4,
  "momentum": {
   "季末拉升": 47,
@@ -19,5 +27,5 @@
   "ok": true,
   "reason": "ok"
  },
- "duration_s": 19.7
+ "duration_s": 28.0
 }
