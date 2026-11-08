@@ -72,6 +72,8 @@ eltdx（数据源，别人的库）  →  本仓库 pipeline.py  →  out/*.json
 | **分片并行** | 工作流把 sz / sh / bj 拆成 3 个 job 跑在不同 runner（不同出口 IP），各抓自己市场，最后一个 job 合并。3 个分片合并结果与单次全量**逐字段一致（5575/5575）** |
 | **去重 + 补跑** | `scripts/should_run.py`：90 分钟内已有成功 run 就整轮跳过；配合 11:35 / 15:35 / 18:05 三个 cron，既不重复跑，也不怕 cron 延迟漏跑 |
 | **重试** | 单批请求失败（`PoolBusyError` / 瞬时断连）自动重试 3 次，指数退避 1s→2s |
+| **通道自愈** | 通达信偶发整条命令通道关闭（`ConnectionClosedError: 7709 runtime command channel is closed`）→ 检测到资金流大面积失败就**新建连接、拆成 60 只小批重试**，恢复后后续阶段改用新连接 |
+| **分片限流** | 三个分片会同时连同一个节点，所以分片内并发压到 `QUOTE_WORKERS=8 / DERIVE_WORKERS=6 / POOL_SIZE=16 / SERVER_COUNT=2`（都可环境变量覆盖） |
 | **线上体检** | `scripts/health.py` 每 30 分钟检查 8 项 + 数据新鲜度（工作日 16:00 后必须是当天数据），失败自动开 `health` 标签 issue，恢复后自动关闭 |
 | **滚动提交** | 上一提交是 `chore: 行情数据更新` 时用 `--amend` 原地覆盖，仓库历史不膨胀 |
 
