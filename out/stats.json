@@ -1,5 +1,5 @@
 {
- "generated_at_utc": "2026-11-08T08:42:07+00:00",
+ "generated_at_utc": "2026-11-08T07:58:02+00:00",
  "eltdx_version": "3.3.5",
  "mode": "merge",
  "shards": 3,
@@ -8,7 +8,7 @@
   "sh",
   "sz"
  ],
- "at": "2026-11-08 16:38",
+ "at": "2026-11-08 15:53",
  "universe": 5575,
  "quotes_ok": 5575,
  "signals_ok": 5575,
@@ -25,5 +25,5 @@
   "ok": true,
   "reason": "ok"
  },
- "duration_s": 29.9
+ "duration_s": 27.1
 }

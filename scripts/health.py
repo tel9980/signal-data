@@ -94,6 +94,24 @@ def check_intraday() -> list[str]:
     return bad
 
 
+def check_gate() -> list[str]:
+    """闸门结论：stats.json 里 gate.ok=false 说明最近一轮被拦下了（数据没更新）。
+
+    这是"数据没更新"背后最常见的原因，直接读出原因写进 issue，省得去翻 Actions 日志。
+    """
+    try:
+        _, body = fetch("https://raw.githubusercontent.com/tel9980/signal-data/main/out/stats.json")
+        st = json.loads(body.decode("utf-8"))
+    except Exception as exc:
+        return [f"闸门检查失败：{type(exc).__name__}: {exc}"]
+    g = st.get("gate") or {}
+    if g.get("ok") is False:
+        print(f"  ❌ 最近一轮被闸门拦下：{g.get('reason')}")
+        return [f"最近一轮数据被拦下，线上仍是旧数据：{g.get('reason')}"]
+    print(f"  ✅ 闸门通过（at {st.get('at')}，{st.get('quotes_ok')} 只）")
+    return []
+
+
 def check_freshness() -> list[str]:
     """数据新鲜度：北京时间的交易日 16:00 之后，px 必须是当天的。"""
     try:
@@ -195,7 +213,7 @@ def kick_update(reason: str, workflow: str = "update.yml", quiet_window: int = 1
 
 def main() -> int:
     print(f"=== 体检 {datetime.now(TZ_CN):%Y-%m-%d %H:%M} (北京时间) ===")
-    bad = check_http() + check_intraday() + check_freshness()
+    bad = check_http() + check_intraday() + check_freshness() + check_gate()
     if bad:
         print(f"\n== 失败 {len(bad)} 项 ==")
         for b in bad:

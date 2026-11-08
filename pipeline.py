@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import argparse
+import gzip
 import json
 import os
 import shutil
@@ -42,6 +43,9 @@ STAGE_DIR = ".staging"        # 暂存目录：全部产出先写这里，闸门
 NAMES_CACHE = "names.json"    # 股票名称缓存（名称一天只变几只）
 HISTORY = "history.json"      # 每日一行留档：指数点位、涨跌家数、异动榜数量
 HISTORY_MAX = 250             # 保留最近 250 个交易日（约 60KB）
+PREV_DIR = ".prev"            # 上一版数据备份（发布前自动留，出问题一条命令回去）
+SANITY_MAX_AVG_JUMP = 8.0     # 平均涨幅单日跳变上限（百分点），超过基本是抓错了
+SANITY_MAX_MOM_RATIO = 10     # 异动榜数量相对上一日放大上限（倍）
 NAMES_TTL_DAYS = 3
 MARKETS = ("sz", "sh", "bj")
 INDICES = (
@@ -493,6 +497,60 @@ def _write_json(path: Path, obj, *, indent=None) -> None:
     path.write_text(text, encoding="utf-8")
 
 
+def market_stats(px: dict) -> dict:
+    """涨跌家数与平均涨幅：既是留档内容，也是合理性校验的依据。"""
+    chgs = [v[1] for v in px.values() if v and v[1] is not None]
+    up = sum(1 for v in px.values() if v and (v[1] or 0) > 0)
+    down = sum(1 for v in px.values() if v and (v[1] or 0) < 0)
+    return {"n": len(px), "up": up, "down": down,
+            "flat": len(px) - up - down,
+            "avg_chg": round(sum(chgs) / len(chgs), 2) if chgs else None}
+
+
+def prev_row(out_dir: Path) -> dict:
+    """上一份留档（不含今天），用于和今天比。"""
+    path = out_dir / HISTORY
+    if not path.exists():
+        return {}
+    try:
+        rows = (json.loads(path.read_text(encoding="utf-8")) or {}).get("rows") or []
+    except Exception:
+        return {}
+    return rows[-1] if rows else {}
+
+
+def sanity_check(stats: dict, out_dir: Path) -> str:
+    """数据合理性校验：体检只查"够不够/新不新"，这里查"对不对"。
+
+    拦住这三类"覆盖率 100% 但内容是错的"：
+      1. 全市场涨跌家数一侧为 0（字段抓错、全平）
+      2. 平均涨幅相对上一日跳变过大（口径写错、单位错）
+      3. 异动榜数量相对上一日放大十倍（规则写错，比如比较符号反了）
+    没有上一份留档时（首次运行、历史被清空）一律放行。
+    """
+    prev = prev_row(out_dir)
+    if not prev or not prev.get("n"):
+        return ""
+    today = stats.get("at") or ""
+    if prev.get("d") and today and prev["d"] == today[:10]:
+        return ""                                   # 同一天补跑，没有可比性
+    n = int(stats.get("quotes_ok") or 0)
+    if n < 1000 or int(prev.get("n") or 0) < 1000:
+        return ""                                   # 样本太小（分片/联调），不做判断
+    up, down = stats.get("up"), stats.get("down")
+    if up is not None and down is not None and (up == 0 or down == 0):
+        return f"涨跌家数异常：涨 {up} / 跌 {down}（全市场不可能只有一边）"
+    avg, prev_avg = stats.get("avg_chg"), prev.get("avg")
+    if avg is not None and prev_avg is not None and abs(avg - prev_avg) > SANITY_MAX_AVG_JUMP:
+        return f"平均涨幅跳变：{prev_avg:+.2f}% → {avg:+.2f}%（差 {abs(avg - prev_avg):.2f} 个百分点）"
+    mom, prev_mom = stats.get("momentum") or {}, prev.get("mom") or {}
+    for key, count in mom.items():
+        base = prev_mom.get(key)
+        if base and base >= 20 and count > base * SANITY_MAX_MOM_RATIO:
+            return f"异动榜「{key}」暴增：昨日 {base} 只 → 今日 {count} 只"
+    return ""
+
+
 def append_history(out_dir: Path, at: str, px: dict, signals: dict, items: list,
                    mom: dict | None) -> dict:
     """把当天的市场概况追加进 out/history.json（同一天重复跑就覆盖当天那行）。
@@ -506,17 +564,15 @@ def append_history(out_dir: Path, at: str, px: dict, signals: dict, items: list,
             rows = (json.loads(path.read_text(encoding="utf-8")) or {}).get("rows") or []
         except Exception:
             rows = []
-    up = sum(1 for v in px.values() if (v[1] or 0) > 0)
-    down = sum(1 for v in px.values() if (v[1] or 0) < 0)
-    chgs = [v[1] for v in px.values() if v[1] is not None]
+    ms = market_stats(px)
     row = {
         "d": at[:10],
         "at": at,
-        "n": len(px),
-        "up": up,
-        "down": down,
-        "flat": len(px) - up - down,
-        "avg": round(sum(chgs) / len(chgs), 2) if chgs else None,
+        "n": ms["n"],
+        "up": ms["up"],
+        "down": ms["down"],
+        "flat": ms["flat"],
+        "avg": ms["avg_chg"],
         "idx": {i["name"]: i.get("last") for i in (items or [])},
         "mom": {g["key"]: g["count"] for g in (mom or {}).get("groups", [])},
         "flow_ok": sum(1 for v in signals.values() if v.get("mn") is not None),
@@ -530,8 +586,13 @@ def append_history(out_dir: Path, at: str, px: dict, signals: dict, items: list,
 def publish(stage: Path, out_dir: Path) -> list[str]:
     """把暂存目录里的文件原子替换到 out_dir（os.replace 同盘原子，前端不会读到半个文件）。"""
     done = []
+    prev = out_dir / PREV_DIR
+    prev.mkdir(parents=True, exist_ok=True)
     for f in sorted(stage.glob("*.json")):
         target = out_dir / f.name
+        if target.exists():                         # 先留一份上一版（gzip 后约 1/3 体积），出问题能一条命令回去
+            with gzip.open(prev / (f.name + ".gz"), "wb", compresslevel=9) as g:
+                g.write(target.read_bytes())
         os.replace(f, target)
         done.append(f"{target.name} {target.stat().st_size / 1024:.0f}KB")
     shutil.rmtree(stage, ignore_errors=True)
@@ -584,6 +645,11 @@ def load_names(client, out_dir: Path) -> tuple[dict[str, str], bool]:
 def _finish(stage: Path, out_dir: Path, stats: dict, args, started: float) -> int:
     """统一的收尾：闸门 → 写 stats → 发布 / 丢弃。返回进程退出码。"""
     ok, why = gate(stats, args)
+    if ok:
+        bad = sanity_check(stats, out_dir)          # 覆盖率达标但内容明显不对，同样拦下
+        if bad:
+            ok, why = False, bad
+            stats["sanity"] = {"ok": False, "reason": bad}
     stats["gate"] = {"ok": ok, "reason": why}
     stats["duration_s"] = round(time.time() - started, 1)
     _write_json(out_dir / "stats.json", stats, indent=1)
@@ -630,6 +696,8 @@ def fetch_all(client, out_dir: Path, args, now_cn, version: str, started: float,
     stats["quotes_ok"] = len(snap)
     at = now_cn.strftime("%Y-%m-%d %H:%M")
     px = {c[-6:]: [v["last"], v["chg"]] for c, v in snap.items()}
+    stats["at"] = at
+    stats.update({k: v for k, v in market_stats(px).items() if k != "n"})
     signals: dict[str, dict] = {}
     mom = None
     names: dict[str, str] = {}
@@ -729,12 +797,13 @@ def merge_shards(shard_dir: Path, out_dir: Path, client, args, now_cn, version: 
                      "names": names})
 
     stats = {"generated_at_utc": now_cn.astimezone(timezone.utc).isoformat(timespec="seconds"),
-             "eltdx_version": str(version), "mode": "merge", "shards": len(files),
+             "eltdx_version": str(version), "mode": "merge", "shards": len(files), "at": at,
              "markets": [f.stem for f in files], "at": at,
              "universe": len(px), "quotes_ok": len(px),
              "signals_ok": len(stocks), "daily_ok": len(stocks),
              "flow_ok": sum(1 for v in stocks.values() if v.get("mn") is not None),
              "indices_ok": len([i for i in items if i["chg"] is not None]) if items else len(INDICES)}
+    stats.update({k: v for k, v in market_stats(px).items() if k != "n"})
     if mom:
         stats["momentum"] = {g["key"]: g["count"] for g in mom["groups"]}
     return _finish(stage, out_dir, stats, args, started)

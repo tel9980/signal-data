@@ -271,3 +271,76 @@ def test_append_history_survives_corrupt_file(tmp_path):
     (tmp_path / pipeline.HISTORY).write_text("{ 坏掉的 json", encoding="utf-8")
     h = pipeline.append_history(tmp_path, "2026-11-08 15:35", {"000001": [1.0, 0.0]}, {}, [], None)
     assert len(h["rows"]) == 1
+
+
+# ------------------------------------------------- 合理性校验（防"对不上"） ----
+
+def _seed_history(out_dir: Path, n=5000, up=2500, down=2400, avg=0.5, mom=None):
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / pipeline.HISTORY).write_text(json.dumps({"updated": "x", "rows": [{
+        "d": "2026-11-07", "at": "2026-11-07 15:35", "n": n, "up": up, "down": down,
+        "flat": n - up - down, "avg": avg, "idx": {},
+        "mom": mom or {"季末拉升": 50, "放量上攻": 60, "创一年新高": 10, "主力大买": 80},
+    }]}, ensure_ascii=False), encoding="utf-8")
+
+
+def test_sanity_passes_on_normal_day(tmp_path):
+    _seed_history(tmp_path)
+    stats = {"at": "2026-11-08 15:35", "quotes_ok": 5575, "up": 2400, "down": 3100,
+             "avg_chg": -1.2, "momentum": {"季末拉升": 47, "放量上攻": 68}}
+    assert pipeline.sanity_check(stats, tmp_path) == ""
+
+
+def test_sanity_blocks_one_sided_breadth(tmp_path):
+    _seed_history(tmp_path)
+    stats = {"at": "2026-11-08 15:35", "quotes_ok": 5575, "up": 0, "down": 0, "avg_chg": 0}
+    assert "涨跌家数异常" in pipeline.sanity_check(stats, tmp_path)
+
+
+def test_sanity_blocks_avg_jump(tmp_path):
+    _seed_history(tmp_path, avg=0.5)
+    stats = {"at": "2026-11-08 15:35", "quotes_ok": 5575, "up": 2400, "down": 3100, "avg_chg": -9.5}
+    assert "平均涨幅跳变" in pipeline.sanity_check(stats, tmp_path)
+
+
+def test_sanity_blocks_momentum_explosion(tmp_path):
+    _seed_history(tmp_path)
+    stats = {"at": "2026-11-08 15:35", "quotes_ok": 5575, "up": 2400, "down": 3100,
+             "avg_chg": -1.2, "momentum": {"季末拉升": 900}}
+    assert "暴增" in pipeline.sanity_check(stats, tmp_path)
+
+
+def test_sanity_skips_first_run_and_small_samples(tmp_path):
+    stats = {"at": "2026-11-08 15:35", "quotes_ok": 5575, "up": 0, "down": 0}
+    assert pipeline.sanity_check(stats, tmp_path) == ""      # 没有历史 → 放行
+    _seed_history(tmp_path)
+    small = {"at": "2026-11-08 15:35", "quotes_ok": 300, "up": 0, "down": 300}
+    assert pipeline.sanity_check(small, tmp_path) == ""      # 联调小样本 → 不判断
+
+
+def test_sanity_skips_same_day_rerun(tmp_path):
+    _seed_history(tmp_path)
+    stats = {"at": "2026-11-07 18:05", "quotes_ok": 5575, "up": 0, "down": 0}
+    assert pipeline.sanity_check(stats, tmp_path) == ""      # 同一天补跑不比
+
+
+# ------------------------------------------------ 上一版备份（能回退） ----
+
+def test_publish_keeps_previous_version(tmp_path):
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "px.json").write_text('{"at":"v1"}', encoding="utf-8")
+    stage = out / pipeline.STAGE_DIR
+    stage.mkdir()
+    (stage / "px.json").write_text('{"at":"v2"}', encoding="utf-8")
+    pipeline.publish(stage, out)
+    assert json.loads((out / "px.json").read_text())["at"] == "v2"
+    import gzip
+    prev = out / pipeline.PREV_DIR / "px.json.gz"
+    assert json.loads(gzip.decompress(prev.read_bytes()))["at"] == "v1"
+
+
+def test_market_stats():
+    ms = pipeline.market_stats({"000001": [10.0, 2.0], "000002": [5.0, -1.0], "000003": [7.0, 0.0]})
+    assert (ms["n"], ms["up"], ms["down"], ms["flat"]) == (3, 1, 1, 1)
+    assert ms["avg_chg"] == pytest.approx(0.33, abs=0.01)

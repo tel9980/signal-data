@@ -23,6 +23,7 @@ eltdx（数据源，别人的库）  →  本仓库 pipeline.py  →  out/*.json
 | `out/names.json` | 代码 → 名称缓存（3 天有效，避免每次都拉证券列表） | — |
 | `out/stats.json` | 本次抓取自检：时间、耗时、股票数、指数数、各组数量、**闸门结论**、eltdx 版本 | — |
 | `out/history.json` | **每日一行留档**（最多 250 个交易日）：指数点位、涨跌家数、平均涨幅、异动榜数量、有资金流的只数 | — |
+| `out/.prev/` | **上一版数据备份**（gzip，约 540KB）：每次发布前自动留，出问题 `bash scripts/rollback.sh` 一条命令回去 | — |
 
 ### px.json
 
@@ -67,6 +68,8 @@ eltdx（数据源，别人的库）  →  本仓库 pipeline.py  →  out/*.json
 | 主力大买 | 当日主力净流入 ≥ 5000 万元 |
 
 ## 稳定性设计
+| 合理性校验 | 闸门只能判断"够不够"，这里判断"对不对"：涨跌家数一侧为 0、平均涨幅单日跳变 >8 个百分点、异动榜数量放大 10 倍，一律拦下并写明原因 |
+| 上一版备份 | 发布前把旧文件 gzip 存到 `out/.prev/`；出问题 `bash scripts/rollback.sh` 拷回并提交，随时可再回退一次 |
 
 | 机制 | 说明 |
 |---|---|
@@ -156,9 +159,9 @@ eltdx 为 Research-Only 许可，本项目仅用于个人学习与协议研究�
 
 ```bash
 python -m pip install pytest
-python -m pytest -q tests        # 17 个用例，全程离线，不需要 eltdx
+python -m pytest -q tests        # 25 个用例，全程离线，不需要 eltdx
 ```
 
 CI 见 `.github/workflows/test.yml`：只改 `pipeline.py` / `tests/` / `scripts/` 时才触发，每天的数据滚动提交不会反复跑。
-锁住的是「改错就让线上出事」的那几块：数据闸门（覆盖率不足不许发布）、分片合并、异动榜规则、断线自愈、每日留档。
+锁住的是「改错就让线上出事」的那几块：数据闸门（覆盖率不足不许发布）、合理性校验、分片合并、异动榜规则、断线自愈、上一版备份、每日留档。
 
