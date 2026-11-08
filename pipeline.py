@@ -227,6 +227,9 @@ def fetch_main_net(client, codes: list[str], workers: int = 8) -> dict[str, floa
             if not recs:
                 continue
             latest = max(recs, key=lambda r: r.date)
+            # 北交所等部分标的没有资金流数据，total_amount 为 0 时留空（前端显示 —），不要写成 0 亿
+            if not float(latest.total_amount or 0):
+                continue
             res[f"{block.exchange}{block.code}"] = round(float(latest.main_net or 0) / 1e4, 1)
         return res
 
