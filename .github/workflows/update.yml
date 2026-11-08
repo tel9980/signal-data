@@ -46,6 +46,9 @@ jobs:
     timeout-minutes: 15
     strategy:
       fail-fast: false
+      # 最多同时跑 2 片：五片一起连同一个通达信节点会把 7709 命令通道挤断，
+      # 单片反而变慢（实测 5 片齐发时 sh 主板的耗时翻三倍）。
+      max-parallel: 2
       matrix:
         include:
           - market: sz
