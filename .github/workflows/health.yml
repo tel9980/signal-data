@@ -8,6 +8,7 @@ on:
 permissions:
   contents: read
   issues: write                 # 出问题自动开 issue
+  actions: write                # 数据陈旧时自动重新触发 update.yml（自愈）
 
 concurrency:
   group: health-check
@@ -19,7 +20,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-      - name: 线上体检（8 项 + 数据新鲜度）
+      - name: 线上体检（8 项 + 收盘新鲜度 + 盘中新鲜度 + 坏了自己重跑）
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: python3 scripts/health.py
