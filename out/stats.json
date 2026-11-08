@@ -1,14 +1,8 @@
 {
- "generated_at_utc": "2026-11-08T03:24:42+00:00",
+ "generated_at_utc": "2026-11-08T02:25:26+00:00",
  "eltdx_version": "3.3.5",
  "mode": "merge",
  "shards": 3,
- "markets": [
-  "bj",
-  "sh",
-  "sz"
- ],
- "at": "2026-11-08 11:21",
  "universe": 5575,
  "quotes_ok": 5575,
  "signals_ok": 5575,
@@ -25,5 +19,5 @@
   "ok": true,
   "reason": "ok"
  },
- "duration_s": 18.9
+ "duration_s": 19.7
 }
