@@ -69,9 +69,9 @@ jobs:
         env:
           # 五个分片同时对同一个通达信节点，单个 shard 的并发要压下来，
           # 否则容易把命令通道挤断（ConnectionClosedError: runtime command channel is closed）
-          QUOTE_WORKERS: "8"
-          DERIVE_WORKERS: "6"
-          POOL_SIZE: "16"
+          QUOTE_WORKERS: "7"
+          DERIVE_WORKERS: "5"
+          POOL_SIZE: "10"
           SERVER_COUNT: "2"
         run: |
           python pipeline.py --markets "${{ matrix.market }}" --prefix "${{ matrix.prefix }}" \
@@ -85,7 +85,9 @@ jobs:
   # 合并 → 闸门 → 发布 → 滚动提交
   publish:
     needs: [guard, shard]
-    if: needs.guard.outputs.go == 'true' || github.event_name == 'workflow_dispatch'
+    # 分片全绿才发布；有失败就交给下面的 fallback 兜底。
+    # 注意必须带 always()，否则依赖 job 失败时 GitHub 会直接 skip 掉这个 job。
+    if: always() && needs.shard.result == 'success' && (needs.guard.outputs.go == 'true' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -119,7 +121,7 @@ jobs:
   # 宁可慢 3 分钟，也不要整轮没有数据。
   fallback:
     needs: [guard, shard]
-    if: needs.shard.result == 'failure' && needs.guard.outputs.go == 'true'
+    if: always() && needs.shard.result == 'failure' && needs.guard.outputs.go == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:

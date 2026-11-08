@@ -76,6 +76,116 @@ def _retry(fn, attempts: int = RETRY, backoff: float = 1.0):
     raise last
 
 
+class _AttrPath:
+    """把 client.a.b(...) 这样的两三级属性路径解析成真正的调用目标。"""
+
+    @staticmethod
+    def resolve(obj, path: tuple[str, ...]):
+        for name in path:
+            obj = getattr(obj, name)
+        return obj
+
+
+class _LazyMember:
+    """延迟解析的成员：属性访问和调用都推迟到真正执行时，再在「当前」连接上解析。
+
+    这样即使客户端本身已经挂了（连属性访问都抛错），也能先换连接再重做这次调用。
+    支持任意深度：client.quotes.get_snapshots、client.helpers.latest_stock_list …
+    """
+
+    def __init__(self, root: "HealingClient", path: tuple[str, ...]):
+        object.__setattr__(self, "_root", root)
+        object.__setattr__(self, "_path", path)
+
+    def __call__(self, *a, **kw):
+        root = object.__getattribute__(self, "_root")
+        path = object.__getattribute__(self, "_path")
+        return root.invoke(lambda cli: _AttrPath.resolve(cli, path)(*a, **kw))
+
+    def __getattr__(self, name: str):
+        return _LazyMember(object.__getattribute__(self, "_root"),
+                           object.__getattribute__(self, "_path") + (name,))
+
+
+class HealingClient:
+    """客户端代理：命令通道被挤断时自动重建连接并重试，调用方完全无感。
+
+    背景：通达信的 7709 runtime 会整条命令通道关闭（ConnectionClosedError /
+    PoolBusyError）。一个分片里 20 多批请求是并发的，通道一挂所有批次会同时失败，
+    整个分片就报废。用代理包一层后，遇到这类错误就换一条新连接把这次调用重做，
+    单个分片的失败率从「全灭」降到「个别批次慢一点」。
+    """
+
+    CONN_HINTS = (
+        "channel is closed",          # 7709 runtime command channel is closed
+        "connectionclosed",
+        "poolbusy",
+        "capacity is full",
+        "reset by peer",
+        "broken pipe",
+        "connection reset",
+        "connection aborted",
+        "timed out",
+        "timeout",
+    )
+
+    def __init__(self, factory, attempts: int = 4):
+        self._factory = factory
+        self._attempts = attempts
+        self._lock = threading.Lock()
+        self._client = factory()
+        self.reconnects = 0
+
+    # ---- 内部 ----------------------------------------------------------
+    @property
+    def client(self):
+        return self._client
+
+    @classmethod
+    def _is_conn_error(cls, exc: Exception) -> bool:
+        text = f"{type(exc).__name__}: {exc}".lower()
+        return any(h in text for h in cls.CONN_HINTS)
+
+    def _swap(self, dead):
+        """只换一次：多个线程同时发现通道挂了时，后到的直接用别人换好的连接。"""
+        with self._lock:
+            if self._client is not dead:
+                return self._client
+            try:
+                dead.close()
+            except Exception:
+                pass
+            self._client = self._factory()
+            self.reconnects += 1
+            log(f"[*] 连接已重建（第 {self.reconnects} 次）")
+            return self._client
+
+    def invoke(self, fn):
+        for i in range(self._attempts):
+            cli = self._client
+            try:
+                return fn(cli)
+            except Exception as exc:
+                if not self._is_conn_error(exc) or i == self._attempts - 1:
+                    raise
+                log(f"[!] {type(exc).__name__}: {exc} → 重建连接后重试（{i + 1}/{self._attempts - 1}）")
+                self._swap(cli)
+                time.sleep(min(1.0 * (2 ** i), 6.0))
+        raise RuntimeError("unreachable")
+
+    # ---- 对外：像 TdxClient 一样用 --------------------------------------
+    def __getattr__(self, name: str):
+        if name.startswith("_"):
+            raise AttributeError(name)
+        return _LazyMember(self, (name,))
+
+    def close(self):
+        try:
+            self._client.close()
+        except Exception:
+            pass
+
+
 def _parallel(fn, chunks, workers, label=""):
     """并发跑 fn(chunk)，结果按顺序收集；单批异常只记日志，不中断整体。"""
     out = []
@@ -250,11 +360,9 @@ def fetch_daily(client, codes: list[str], count: int = 250, workers: int = DERIV
 def fetch_main_net(client, codes: list[str], workers: int = DERIVE_WORKERS, factory=None):
     """当日主力净流入（万元）。取 money_flow 最新一条记录的 main_net。
 
-    通达信的 runtime 偶发会整条命令通道关闭（ConnectionClosedError: 7709 runtime
-    command channel is closed），这时所有批次会同时失败。检测到"几乎全灭"就重建
-    客户端、把失败批次拆小重试一次；重建出的客户端会返回给调用方继续用。
+    整片失败时（通道抖动）把失败批次拆成 FLOW_RETRY_CHUNK 小批再补一次。
 
-    返回 (净流入字典, 当前可用客户端)。
+    返回 (净流入字典, 当前可用客户端) —— 客户端由 HealingClient 代理维持，这里原样返回。
     """
 
     def work_with(cl):
@@ -298,30 +406,14 @@ def fetch_main_net(client, codes: list[str], workers: int = DERIVE_WORKERS, fact
     chunks = [codes[i:i + FLOW_CHUNK] for i in range(0, len(codes), FLOW_CHUNK)]
     merged, failed = run(client, chunks)
 
-    # 全军覆没（或大面积失败）通常是命令通道挂了，换一条新连接再试一次
-    if failed and factory and len(merged) < 0.5 * len(codes):
-        log(f"[!] 资金流整体异常（{len(merged)}/{len(codes)}），新建连接后重试 {len(failed)} 批")
-        try:
-            fresh = factory()
-        except Exception as exc:
-            log(f"[!] 重建连接失败：{type(exc).__name__}: {exc}")
-        else:
-            smaller = [c[i:i + FLOW_RETRY_CHUNK]
-                       for c in failed for i in range(0, len(c), FLOW_RETRY_CHUNK)]
-            retry_got, still = run(fresh, smaller)
-            merged.update(retry_got)
-            log(f"[*] 重试后补充 {len(retry_got)} 只，仍失败 {len(still)} 批")
-            if len(merged) >= 0.5 * len(codes):
-                old, client = client, fresh          # 老连接已废，后面改用新连接
-                try:
-                    old.close()
-                except Exception:
-                    pass
-            else:
-                try:
-                    fresh.close()
-                except Exception:
-                    pass
+    # 断连由 HealingClient 代理兜底重建，这里只需要把整片失败的情况再拆小补一次
+    if failed and len(merged) < 0.5 * len(codes):
+        log(f"[!] 资金流整体异常（{len(merged)}/{len(codes)}），把 {len(failed)} 批拆成小批重试")
+        smaller = [c[i:i + FLOW_RETRY_CHUNK]
+                   for c in failed for i in range(0, len(c), FLOW_RETRY_CHUNK)]
+        retry_got, still = run(client, smaller)
+        merged.update(retry_got)
+        log(f"[*] 重试后补充 {len(retry_got)} 只，仍失败 {len(still)} 批")
 
     log(f"[*] 资金流：{len(chunks)} 批 → {len(merged)} 只有主力净流入")
     return merged, client
@@ -646,7 +738,8 @@ def main() -> int:
         return TdxClient(timeout=args.timeout, probe_hosts=True,
                          server_count=SERVER_COUNT, pool_size=POOL_SIZE)
 
-    client = make_client()
+    # 用代理包一层：通达信命令通道被挤断时自动换连接重试，避免整片报废
+    client = HealingClient(make_client)
     try:
         if args.merge:
             return merge_shards(Path(args.merge), out_dir, client, args, now_cn, version, started)
