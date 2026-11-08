@@ -1,0 +1,25 @@
+name: Health Check
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"      # 每 30 分钟体检一次
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write                 # 出问题自动开 issue
+
+concurrency:
+  group: health-check
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: 线上体检（8 项 + 数据新鲜度）
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 scripts/health.py

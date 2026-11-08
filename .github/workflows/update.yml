@@ -2,24 +2,72 @@ name: Update Market Data
 
 on:
   schedule:
-    # 交易日两班：北京时间 11:35（午间）与 15:35（收盘后）
-    # GitHub 的 cron 用 UTC：03:35 / 07:35
+    # 北京时间 11:35（午间）、15:35（收盘后）、18:05（补跑：前面漏了才跑）
+    # GitHub 的 cron 用 UTC：03:35 / 07:35 / 10:05
     - cron: "35 3 * * 1-5"
     - cron: "35 7 * * 1-5"
+    - cron: "5 10 * * 1-5"
   workflow_dispatch:        # 也可在 Actions 页面手动点 Run workflow
 
 permissions:
   contents: write
+  actions: read             # guard 要读历史 run
 
 concurrency:
   group: update-market-data
   cancel-in-progress: false
 
 jobs:
-  update:
+  # 去重 + 补跑：90 分钟内刚成功过就整轮跳过（GitHub cron 会延迟/重复触发）
+  guard:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 5
+    outputs:
+      go: ${{ steps.check.outputs.go }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: check
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          WORKFLOW_FILE: update.yml
+        run: |
+          if python3 scripts/should_run.py; then
+            echo "go=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "go=false" >> "$GITHUB_OUTPUT"
+          fi
 
+  # 三个市场并行：sz / sh / bj 各跑一个 runner（不同 IP，互不抢通达信容量）
+  shard:
+    needs: guard
+    if: needs.guard.outputs.go == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        market: [sz, sh, bj]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: python -m pip install -q -r requirements.txt
+      - name: 抓取 ${{ matrix.market }} 市场
+        run: python pipeline.py --markets ${{ matrix.market }} --shard --out-dir shard
+      - uses: actions/upload-artifact@v4
+        with:
+          name: shard-${{ matrix.market }}
+          path: shard
+          retention-days: 1
+
+  # 合并 → 闸门 → 发布 → 滚动提交
+  publish:
+    needs: [guard, shard]
+    if: needs.guard.outputs.go == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -35,15 +83,24 @@ jobs:
       - name: Install eltdx
         run: python -m pip install -q -r requirements.txt
 
-      - name: Run pipeline
-        run: python pipeline.py
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: shard-*
+          path: shard
+          merge-multiple: true
+
+      - name: Merge + gate + publish
+        run: python pipeline.py --merge shard --out-dir out
 
       - name: Commit (rolling)
         run: |
           git config user.name "actions-user"
           git config user.email "actions@github.com"
-          git add -A out
 
+          # 闸门未通过时 pipeline 已 exit 3，走不到这里；保险起见再校验一次
+          python3 -c "import json;d=json.load(open('out/stats.json'));assert d['gate']['ok'], d['gate']"
+
+          git add -A out
           if git diff --cached --quiet; then
             echo "输出无变化，跳过提交"
             exit 0

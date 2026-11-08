@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import shutil
 import sys
 import threading
 import time
@@ -29,6 +31,15 @@ from pathlib import Path
 CHUNK = 80                    # 通达信单次快照上限，80 只/次
 BAR_CHUNK = 300               # 日 K 每批代码数（一批＝一个请求；19 批并发跑完）
 FLOW_CHUNK = 300              # 资金流每批代码数（一批＝一个请求，比库默认的 75 少 4 倍往返）
+QUOTE_WORKERS = 10            # 快照并发（Actions 上是延迟受限，加并发直接换算成时间）
+DERIVE_WORKERS = 10           # 日 K / 资金流并发
+SERVER_COUNT = 4              # 服务器数（多了反而抢容量，实测 4 最稳）
+POOL_SIZE = 32                # 连接池（复用建连，省掉每次握手）
+RETRY = 3                     # 单批失败重试次数（PoolBusy / 瞬时断连）
+MIN_COVERAGE = 0.90           # 快照覆盖率低于此值视为异常，整轮不发布
+STAGE_DIR = ".staging"        # 暂存目录：全部产出先写这里，闸门通过才原子替换
+NAMES_CACHE = "names.json"    # 股票名称缓存（名称一天只变几只）
+NAMES_TTL_DAYS = 3
 MARKETS = ("sz", "sh", "bj")
 INDICES = (
     ("上证指数", "sh000001"),
@@ -51,6 +62,19 @@ def log(msg: str) -> None:
     print(msg, flush=True)
 
 
+def _retry(fn, attempts: int = RETRY, backoff: float = 1.0):
+    """瞬时错误（PoolBusy / 断连）重试，指数退避；最后一次仍失败才抛出。"""
+    last = None
+    for i in range(attempts):
+        try:
+            return fn()
+        except Exception as exc:
+            last = exc
+            if i < attempts - 1:
+                time.sleep(backoff * (i + 1))
+    raise last
+
+
 def _parallel(fn, chunks, workers, label=""):
     """并发跑 fn(chunk)，结果按顺序收集；单批异常只记日志，不中断整体。"""
     out = []
@@ -58,7 +82,7 @@ def _parallel(fn, chunks, workers, label=""):
 
     def work(chunk):
         try:
-            res = fn(chunk)
+            res = _retry(lambda: fn(chunk))
         except Exception as exc:                       # 单批失败不影响整体
             log(f"[!] {label}失败（{len(chunk)} 只）：{type(exc).__name__}: {exc}")
             return
@@ -70,10 +94,10 @@ def _parallel(fn, chunks, workers, label=""):
     return out
 
 
-def fetch_universe(client, limit: int) -> list[str]:
-    """取全市场 A 股代码，统一成 sz000001 / sh600000 / bj430047 这种带前缀的形式。"""
+def fetch_universe(client, limit: int, markets: tuple[str, ...] | list[str] = MARKETS) -> list[str]:
+    """取 A 股代码，统一成 sz000001 / sh600000 / bj430047 这种带前缀的形式。"""
     codes: list[str] = []
-    for market in MARKETS:
+    for market in markets:
         try:
             rows = client.codes.a_shares(market)
             got = [f"{market}{s.code}" for s in rows]
@@ -96,7 +120,7 @@ def fetch_names(client) -> dict[str, str]:
         return {}
 
 
-def fetch_quotes(client, codes: list[str], workers: int = 10) -> dict[str, dict]:
+def fetch_quotes(client, codes: list[str], workers: int = QUOTE_WORKERS) -> dict[str, dict]:
     """并发抓快照，返回 {code: {last, chg, hand, amount, high, low, open}}；
     停牌/无成交（价格为 0）的直接丢弃。"""
     chunks = [codes[i:i + CHUNK] for i in range(0, len(codes), CHUNK)]
@@ -107,7 +131,7 @@ def fetch_quotes(client, codes: list[str], workers: int = 10) -> dict[str, dict]
     def work(chunk: list[str]) -> None:
         nonlocal zero
         try:
-            rows = client.quotes.get_snapshots(chunk, on_missing="skip")
+            rows = _retry(lambda: client.quotes.get_snapshots(chunk, on_missing="skip"))
         except Exception as exc:
             log(f"[!] 快照失败（{len(chunk)} 只）：{type(exc).__name__}: {exc}")
             return
@@ -166,7 +190,7 @@ def fetch_indices(client) -> list[dict]:
 
 # ---------------------------------------------------------------- 派生指标 ----
 
-def fetch_daily(client, codes: list[str], count: int = 250, workers: int = 8) -> dict[str, dict]:
+def fetch_daily(client, codes: list[str], count: int = 250, workers: int = DERIVE_WORKERS) -> dict[str, dict]:
     """日 K → 各周期涨幅、距 250 日高/低点、量比。返回 {code: {...}}。
 
     口径：
@@ -215,7 +239,7 @@ def fetch_daily(client, codes: list[str], count: int = 250, workers: int = 8) ->
     return merged
 
 
-def fetch_main_net(client, codes: list[str], workers: int = 8) -> dict[str, float]:
+def fetch_main_net(client, codes: list[str], workers: int = DERIVE_WORKERS) -> dict[str, float]:
     """当日主力净流入（万元）。取 money_flow 最新一条记录的 main_net。"""
     chunks = [codes[i:i + FLOW_CHUNK] for i in range(0, len(codes), FLOW_CHUNK)]
 
@@ -304,6 +328,212 @@ def build_momentum(signals: dict[str, dict], cap: int = 300) -> dict:
     return {"rules": RULES, "groups": groups}
 
 
+# ---------------------------------------------------------------- 发布工具 ----
+
+def _write_json(path: Path, obj, *, indent=None) -> None:
+    text = (json.dumps(obj, ensure_ascii=False, separators=(",", ":")) if indent is None
+            else json.dumps(obj, ensure_ascii=False, indent=indent))
+    path.write_text(text, encoding="utf-8")
+
+
+def publish(stage: Path, out_dir: Path) -> list[str]:
+    """把暂存目录里的文件原子替换到 out_dir（os.replace 同盘原子，前端不会读到半个文件）。"""
+    done = []
+    for f in sorted(stage.glob("*.json")):
+        target = out_dir / f.name
+        os.replace(f, target)
+        done.append(f"{target.name} {target.stat().st_size / 1024:.0f}KB")
+    shutil.rmtree(stage, ignore_errors=True)
+    return done
+
+
+def gate(stats: dict, args) -> tuple[bool, str]:
+    """数据闸门：覆盖率不达标就整轮不发布，避免"半份数据"静默上线。"""
+    universe = int(stats.get("universe") or 0)
+    quotes = int(stats.get("quotes_ok") or 0)
+    if not universe:
+        return False, "没有取到股票列表"
+    need = int(universe * args.min_coverage)
+    if quotes < need:
+        return False, f"快照覆盖不足：{quotes}/{universe} < {need}（阈值 {args.min_coverage:.0%}）"
+    if not args.no_signals:
+        sig = int(stats.get("signals_ok") or 0)
+        if sig < quotes * 0.95:
+            return False, f"派生指标缺失：signals {sig} / 快照 {quotes}"
+    if not args.no_signals:
+        only_bj = [m for m in (stats.get("markets") or [])] == ["bj"]
+        daily = int(stats.get("daily_ok") or 0)
+        sig = int(stats.get("signals_ok") or 0)
+        if sig and daily < sig * 0.9:
+            return False, f"日K缺失：只有 {daily}/{sig} 只有历史数据（正常应在 99% 以上）"
+        flow = int(stats.get("flow_ok") or 0)
+        if sig and flow < sig * 0.5 and not only_bj:
+            return False, f"资金流异常：只有 {flow}/{sig} 只有主力净流入（正常应在 90% 以上）"
+    if not args.no_indices and int(stats.get("indices_ok") or 0) < len(INDICES):
+        return False, f"指数只拿到 {stats.get('indices_ok')}/{len(INDICES)} 个"
+    return True, "ok"
+
+
+def load_names(client, out_dir: Path) -> tuple[dict[str, str], bool]:
+    """名称：优先用 out/names.json（NAMES_TTL_DAYS 天内），否则现拉。返回 (names, 是否新拉)。"""
+    cache = out_dir / NAMES_CACHE
+    if cache.exists():
+        try:
+            data = json.loads(cache.read_text(encoding="utf-8"))
+            stamp = datetime.fromisoformat(str(data.get("updated_utc", "")).replace("Z", "+00:00"))
+            age = (datetime.now(timezone.utc) - stamp).total_seconds() / 86400
+            if age < NAMES_TTL_DAYS and data.get("names"):
+                log(f"[*] 名称走缓存：{len(data['names'])} 只（{age:.1f} 天前）")
+                return data["names"], False
+        except Exception:
+            pass
+    return fetch_names(client), True
+
+
+def _finish(stage: Path, out_dir: Path, stats: dict, args, started: float) -> int:
+    """统一的收尾：闸门 → 写 stats → 发布 / 丢弃。返回进程退出码。"""
+    ok, why = gate(stats, args)
+    stats["gate"] = {"ok": ok, "reason": why}
+    stats["duration_s"] = round(time.time() - started, 1)
+    _write_json(out_dir / "stats.json", stats, indent=1)
+    if not ok:
+        log(f"[x] 数据闸门未通过：{why}")
+        log("[x] 本轮不发布，线上保持上一份数据（stats.json 已写明原因）")
+        if not args.keep_partial:
+            shutil.rmtree(stage, ignore_errors=True)
+        return 3
+    for line in publish(stage, out_dir):
+        log(f"[+] 发布 {line}")
+    log(f"[*] 完成，耗时 {stats['duration_s']}s → {out_dir}/")
+    return 0
+
+
+FIELDS = {
+    "n": "名称", "c": "收盘价", "p": "当日涨跌幅%", "d5": "近5日涨幅%",
+    "d20": "近20日涨幅%", "d60": "近60日涨幅%", "hi": "距250日高点%",
+    "lo": "距250日低点%", "vr": "量比（当日/前5日均量）", "to": "换手率%",
+    "mn": "主力净流入(万元)",
+}
+
+
+def fetch_all(client, out_dir: Path, args, now_cn, version: str, started: float) -> int:
+    stage = out_dir / STAGE_DIR
+    shutil.rmtree(stage, ignore_errors=True)
+    stage.mkdir(parents=True, exist_ok=True)
+    stats = {"generated_at_utc": now_cn.astimezone(timezone.utc).isoformat(timespec="seconds"),
+             "eltdx_version": str(version)}
+    markets = [m.strip() for m in args.markets.split(",") if m.strip()]
+    stats["markets"] = markets
+
+    codes = fetch_universe(client, args.limit, markets=markets)
+    if not codes:
+        log("[x] 没有取到股票列表，退出")
+        return 1
+    stats["universe"] = len(codes)
+
+    snap = fetch_quotes(client, codes, workers=args.workers)
+    stats["quotes_ok"] = len(snap)
+    at = now_cn.strftime("%Y-%m-%d %H:%M")
+    px = {c[-6:]: [v["last"], v["chg"]] for c, v in snap.items()}
+    signals: dict[str, dict] = {}
+    mom = None
+    names: dict[str, str] = {}
+    names_fresh = False
+
+    if snap and not args.no_signals:
+        names, names_fresh = load_names(client, out_dir)
+        daily = fetch_daily(client, list(snap), workers=args.workers)
+        stats["daily_ok"] = len(daily)
+        main_net = fetch_main_net(client, list(snap), workers=args.workers)
+        circulating = fetch_circulating(client, list(snap))
+        signals = build_signals(snap, daily, main_net, circulating, names)
+        stats["signals_ok"] = len(signals)
+        stats["flow_ok"] = len(main_net)
+        mom = build_momentum(signals)
+        stats["momentum"] = {g["key"]: g["count"] for g in mom["groups"]}
+
+    items: list[dict] = []
+    if not args.no_indices:
+        items = fetch_indices(client)
+        stats["indices_ok"] = len([i for i in items if i["chg"] is not None])
+    else:
+        stats["indices_ok"] = len(INDICES)
+
+    if names_fresh and names:
+        _write_json(stage / NAMES_CACHE,
+                    {"updated_utc": now_cn.astimezone(timezone.utc).isoformat(timespec="seconds"),
+                     "names": names})
+
+    if args.shard:
+        name = "-".join(markets) + ".json"
+        _write_json(stage / name, {"at": at, "markets": markets, "px": px,
+                                   "stocks": signals, "names": names})
+        log(f"[+] 分片 {name}：{len(px)} 只现价 / {len(signals)} 只指标")
+    else:
+        _write_json(stage / "px.json", {"at": at, "px": px})
+        if signals:
+            _write_json(stage / "signals.json", {"updated": at, "fields": FIELDS, "stocks": signals})
+            mom["updated"] = at
+            _write_json(stage / "momentum.json", mom, indent=1)
+            # 首屏单文件：px + signals + momentum + indices 一次请求拿全
+            _write_json(stage / "live.json", {"updated": at, "at": at, "px": px,
+                                              "stocks": signals, "momentum": mom,
+                                              "indices": items})
+        if items:
+            _write_json(stage / "indices.json", {"updated": at, "items": items}, indent=1)
+
+    return _finish(stage, out_dir, stats, args, started)
+
+
+def merge_shards(shard_dir: Path, out_dir: Path, client, args, now_cn, version: str,
+                 started: float) -> int:
+    """把 matrix 各分片（每个市场一个 json）合并成最终产出。"""
+    stage = out_dir / STAGE_DIR
+    shutil.rmtree(stage, ignore_errors=True)
+    stage.mkdir(parents=True, exist_ok=True)
+    px: dict[str, list] = {}
+    stocks: dict[str, dict] = {}
+    names: dict[str, str] = {}
+    at = ""
+    files = [f for f in sorted(shard_dir.glob("*.json"))
+             if f.name not in (NAMES_CACHE, "stats.json")]
+    for f in files:
+        d = json.loads(f.read_text(encoding="utf-8"))
+        px.update(d.get("px") or {})
+        stocks.update(d.get("stocks") or {})
+        names.update(d.get("names") or {})
+        at = d.get("at") or at
+    log(f"[*] 合并 {len(files)} 个分片 → {len(px)} 只现价 / {len(stocks)} 只指标")
+    if not at:
+        at = now_cn.strftime("%Y-%m-%d %H:%M")
+
+    mom = build_momentum(stocks) if stocks else None
+    items = fetch_indices(client) if not args.no_indices else []
+    if stocks:
+        _write_json(stage / "px.json", {"at": at, "px": px})
+        _write_json(stage / "signals.json", {"updated": at, "fields": FIELDS, "stocks": stocks})
+        mom["updated"] = at
+        _write_json(stage / "momentum.json", mom, indent=1)
+        _write_json(stage / "live.json", {"updated": at, "at": at, "px": px,
+                                          "stocks": stocks, "momentum": mom, "indices": items})
+    if items:
+        _write_json(stage / "indices.json", {"updated": at, "items": items}, indent=1)
+    if names:
+        _write_json(stage / NAMES_CACHE,
+                    {"updated_utc": now_cn.astimezone(timezone.utc).isoformat(timespec="seconds"),
+                     "names": names})
+
+    stats = {"generated_at_utc": now_cn.astimezone(timezone.utc).isoformat(timespec="seconds"),
+             "eltdx_version": str(version), "mode": "merge", "shards": len(files),
+             "universe": len(px), "quotes_ok": len(px),
+             "signals_ok": len(stocks), "daily_ok": len(stocks),
+             "flow_ok": sum(1 for v in stocks.values() if v.get("mn") is not None),
+             "indices_ok": len([i for i in items if i["chg"] is not None]) if items else len(INDICES)}
+    if mom:
+        stats["momentum"] = {g["key"]: g["count"] for g in mom["groups"]}
+    return _finish(stage, out_dir, stats, args, started)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="用 eltdx 生成 signal 行情 JSON")
     ap.add_argument("--out-dir", default="out")
@@ -311,6 +541,15 @@ def main() -> int:
     ap.add_argument("--no-indices", action="store_true", help="跳过指数")
     ap.add_argument("--no-signals", action="store_true", help="跳过派生指标（signals/momentum）")
     ap.add_argument("--timeout", type=float, default=8.0)
+    ap.add_argument("--workers", type=int, default=QUOTE_WORKERS, help="并发数（快照/日K/资金流共用）")
+    ap.add_argument("--min-coverage", type=float, default=MIN_COVERAGE,
+                    help="快照覆盖率下限，低于此值本轮不发布（默认 0.9）")
+    ap.add_argument("--markets", default=",".join(MARKETS), help="只抓指定市场，如 sz,sh")
+    ap.add_argument("--shard", action="store_true",
+                    help="分片模式：按市场各写一个 <market>.json（配合 matrix 并行）")
+    ap.add_argument("--merge", default="", metavar="DIR",
+                    help="合并模式：把 DIR/*.json 分片合并成最终产出")
+    ap.add_argument("--keep-partial", action="store_true", help="闸门未通过时保留暂存文件便于排查")
     args = ap.parse_args()
 
     out_dir = Path(args.out_dir)
@@ -332,68 +571,17 @@ def main() -> int:
         version = getattr(eltdx, "__version__", "?")
     log(f"=== signal-data {now_cn:%Y-%m-%d %H:%M} (eltdx {version}) ===")
 
-    client = TdxClient(timeout=args.timeout, probe_hosts=True, server_count=4, pool_size=16)
-    stats = {"generated_at_utc": now_cn.astimezone(timezone.utc).isoformat(timespec="seconds"),
-             "eltdx_version": str(version)}
+    client = TdxClient(timeout=args.timeout, probe_hosts=True,
+                       server_count=SERVER_COUNT, pool_size=POOL_SIZE)
     try:
-        codes = fetch_universe(client, args.limit)
-        if not codes:
-            log("[x] 没有取到股票列表，退出")
-            return 1
-        stats["universe"] = len(codes)
-
-        snap = fetch_quotes(client, codes)
-        if snap:
-            px = {c[-6:]: [v["last"], v["chg"]] for c, v in snap.items()}
-            payload = {"at": now_cn.strftime("%Y-%m-%d %H:%M"), "px": px}
-            (out_dir / "px.json").write_text(
-                json.dumps(payload, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
-            log(f"[+] px.json：{len(px)} 只")
-        else:
-            log("[!] px 为空，不写文件")
-        stats["quotes_ok"] = len(snap)
-
-        if snap and not args.no_signals:
-            names = fetch_names(client)
-            daily = fetch_daily(client, list(snap))
-            main_net = fetch_main_net(client, list(snap))
-            circulating = fetch_circulating(client, list(snap))
-            signals = build_signals(snap, daily, main_net, circulating, names)
-            payload = {"updated": now_cn.strftime("%Y-%m-%d %H:%M"), "fields": {
-                "n": "名称", "c": "收盘价", "p": "当日涨跌幅%", "d5": "近5日涨幅%",
-                "d20": "近20日涨幅%", "d60": "近60日涨幅%", "hi": "距250日高点%",
-                "lo": "距250日低点%", "vr": "量比（当日/前5日均量）", "to": "换手率%",
-                "mn": "主力净流入(万元)"}, "stocks": signals}
-            (out_dir / "signals.json").write_text(
-                json.dumps(payload, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
-            log(f"[+] signals.json：{len(signals)} 只")
-            mom = build_momentum(signals)
-            mom["updated"] = payload["updated"]
-            (out_dir / "momentum.json").write_text(
-                json.dumps(mom, ensure_ascii=False, indent=1), encoding="utf-8")
-            log(f"[+] momentum.json：{len(mom['groups'])} 个分组")
-            stats["signals_ok"] = len(signals)
-            stats["momentum"] = {g["key"]: g["count"] for g in mom["groups"]}
-
-        if not args.no_indices:
-            items = fetch_indices(client)
-            ok = [i for i in items if i["chg"] is not None]
-            if ok:
-                (out_dir / "indices.json").write_text(
-                    json.dumps({"updated": now_cn.strftime("%Y-%m-%d %H:%M"), "items": items},
-                               ensure_ascii=False, indent=1), encoding="utf-8")
-                log(f"[+] indices.json：{len(ok)}/{len(items)} 个指数")
-            stats["indices_ok"] = len(ok)
+        if args.merge:
+            return merge_shards(Path(args.merge), out_dir, client, args, now_cn, version, started)
+        return fetch_all(client, out_dir, args, now_cn, version, started)
     finally:
         try:
             client.close()
         except Exception:
             pass
-
-    stats["duration_s"] = round(time.time() - started, 1)
-    (out_dir / "stats.json").write_text(json.dumps(stats, ensure_ascii=False, indent=1), encoding="utf-8")
-    log(f"[*] 完成，耗时 {stats['duration_s']}s → {out_dir}/")
-    return 0
 
 
 if __name__ == "__main__":
