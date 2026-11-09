@@ -1,6 +1,6 @@
 name: test
 
-# 只在这几个文件变化时跑，避免每天的数据滚动提交反复触发（out/** 不在 paths 里）
+# 代码变化时跑测试；out/** 变化时也跑（只跑数据完整性自检，防止误删/退回旧数据）
 on:
   push:
     branches: [main]
@@ -8,6 +8,7 @@ on:
       - 'pipeline.py'
       - 'tests/**'
       - 'scripts/**'
+      - 'out/**'
       - 'requirements.txt'
       - '.github/workflows/test.yml'
   pull_request:
@@ -27,4 +28,7 @@ jobs:
           python-version: '3.11'
       # 不需要装 eltdx：pipeline 只在 main() 里 import 它，测试全部离线
       - run: python -m pip install -q pytest
+      - name: 数据完整性自检（防止 out/ 被误删/退回旧版）
+        run: python3 scripts/check_data_integrity.py
+
       - run: python -m pytest -q tests
