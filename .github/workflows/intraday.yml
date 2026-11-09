@@ -9,6 +9,11 @@ on:
     - cron: "*/10 1-3 * * 1-5"
     - cron: "*/10 5-7 * * 1-5"
   workflow_dispatch:
+    inputs:
+      force:
+        description: "非交易时段也跑（只用于手动调试）"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -32,14 +37,18 @@ jobs:
       - run: python -m pip install -q -r requirements.txt
 
       - name: 交易时段守卫
+        id: guard
+        continue-on-error: true        # 非交易时段跳过是正常行为，不该显示成红色失败
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          if [ "${{ inputs.force }}" = "true" ]; then
+            echo "手动强制运行（inputs.force=true）"
             python3 scripts/trading_time.py --force
           else
             python3 scripts/trading_time.py
           fi
 
       - name: 抓快照（不含派生指标）
+        if: steps.guard.outcome == 'success'
         env:
           QUOTE_WORKERS: "6"        # 盘中压着跑，避免挤断通达信命令通道
           POOL_SIZE: "8"
@@ -47,4 +56,5 @@ jobs:
         run: python pipeline.py --no-signals --out-dir intraday
 
       - name: 发布到 intraday 分支
+        if: steps.guard.outcome == 'success'
         run: bash scripts/publish_intraday.sh
