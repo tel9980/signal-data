@@ -19,7 +19,8 @@ from pathlib import Path
 
 OUT = Path(__file__).resolve().parents[1] / "out"
 REQUIRED = ["px.json", "signals.json", "live.json", "live-core.json",
-            "momentum.json", "indices.json", "names.json", "stats.json", "history.json"]
+            "momentum.json", "indices.json", "names.json", "stats.json", "history.json",
+            "ledger.json"]
 
 
 def load(path: Path):

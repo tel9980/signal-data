@@ -344,3 +344,30 @@ def test_market_stats():
     ms = pipeline.market_stats({"000001": [10.0, 2.0], "000002": [5.0, -1.0], "000003": [7.0, 0.0]})
     assert (ms["n"], ms["up"], ms["down"], ms["flat"]) == (3, 1, 1, 1)
     assert ms["avg_chg"] == pytest.approx(0.33, abs=0.01)
+
+def test_build_ledger_marks_facts_and_result(tmp_path):
+    import json
+    (tmp_path / "ledger").mkdir()
+    (tmp_path / "ledger" / "entries.json").write_text(json.dumps({"v": 1, "entries": [
+        {"code": "300026", "name": "红日药业", "found": "2026-11-08", "price_found": 3.22,
+         "trigger": "国资在十大股东", "waiting": "下一份季报", "falsify": "营收继续下滑",
+         "due_days": 30},
+        {"code": "600000", "name": "浦发银行", "found": "2026-10-01", "price_found": 10.0,
+         "due_days": 30},
+    ]}), encoding="utf-8")
+    out = tmp_path / "out"
+    out.mkdir()
+    led = pipeline.build_ledger(out, {"300026": [3.18, -1.24], "600000": [11.0, 0.5]}, "2026-11-09 19:00")
+    assert led["v"] == 2
+    by = {e["code"]: e for e in led["entries"]}
+    # 还没到期 → 未到期，later 写事实
+    assert by["300026"]["result"] == "未到期"
+    assert "-1.2%" in by["300026"]["later"]
+    # 已过 30 天 → 机械对账：涨了算看对了
+    assert by["600000"]["result"] == "看对了"
+    assert by["600000"]["due"] == "2026-10-31"
+
+
+def test_build_ledger_missing_source(tmp_path):
+    (tmp_path / "out").mkdir()
+    assert pipeline.build_ledger(tmp_path / "out", {}, "2026-11-09 19:00") is None

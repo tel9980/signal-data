@@ -26,7 +26,7 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone, timedelta
+from datetime import date, datetime, timezone, timedelta
 from pathlib import Path
 
 CHUNK = 80                    # 通达信单次快照上限，80 只/次
@@ -42,7 +42,9 @@ MIN_COVERAGE = 0.90           # 快照覆盖率低于此值视为异常，整轮
 STAGE_DIR = ".staging"        # 暂存目录：全部产出先写这里，闸门通过才原子替换
 NAMES_CACHE = "names.json"    # 股票名称缓存（名称一天只变几只）
 HISTORY = "history.json"      # 每日一行留档：指数点位、涨跌家数、异动榜数量
-HISTORY_MAX = 250             # 保留最近 250 个交易日（约 60KB）
+HISTORY_MAX = 250
+LEDGER_SRC = "ledger/entries.json"      # 台账原始记录（由微信事实包自动追加）
+LEDGER_OUT = "ledger.json"            # 给前端用的台账（补上"后来怎样"）             # 保留最近 250 个交易日（约 60KB）
 PREV_DIR = ".prev"            # 上一版数据备份（发布前自动留，出问题一条命令回去）
 SANITY_MAX_AVG_JUMP = 8.0     # 平均涨幅单日跳变上限（百分点），超过基本是抓错了
 SANITY_MAX_MOM_RATIO = 10     # 异动榜数量相对上一日放大上限（倍）
@@ -462,6 +464,88 @@ def build_signals(snap: dict[str, dict], daily: dict[str, dict], main_net: dict[
     return out
 
 
+def build_ledger(out_dir: Path, px: dict[str, list], at: str) -> dict | None:
+    """把台账原始记录（ledger/entries.json）补上"后来怎样"，生成前端能用的 ledger.json。
+
+    原始记录由微信里的事实包自动附加，字段：
+      {code, name, found(YYYY-MM-DD), price_found, trigger, source, waiting,
+       falsify, due_days, result?, later?}
+
+    这里只做三件机械的事，不做主观判断：
+      1. 读现在的价格，算累计涨跌和经过了几天；
+      2. `later` 写事实（第 N 天 · 现价 · 累计几%）；
+      3. 过了 due_days 就按累计涨跌机械对账（涨=看对了，跌=看错了），
+         并在 later 里注明是机械判定，人工可以在 entries.json 里改。
+    """
+    src = out_dir.parent / LEDGER_SRC
+    if not src.exists():
+        return None
+    try:
+        doc = json.loads(src.read_text(encoding="utf-8")) or {}
+    except Exception as exc:  # noqa: BLE001
+        log(f"[!] 台账源读取失败（{exc}），本轮跳过台账")
+        return None
+    raw = doc.get("entries") or []
+    if not raw:
+        return None
+
+    today = date.fromisoformat(at[:10])
+    entries: list[dict] = []
+    for e in raw:
+        code = str(e.get("code") or "")[-6:]
+        if not code:
+            continue
+        now = (px.get(code) or [None])[0]
+        pf = e.get("price_found")
+        days = None
+        try:
+            days = (today - date.fromisoformat(str(e.get("found"))[:10])).days
+        except Exception:
+            pass
+        chg = None
+        if now and pf:
+            try:
+                chg = (float(now) / float(pf) - 1) * 100
+            except ZeroDivisionError:
+                chg = None
+        due_days = int(e.get("due_days") or 30)
+        result = e.get("result") or "未到期"
+        facts = []
+        if days is not None:
+            facts.append(f"第 {days} 天")
+        if now:
+            facts.append(f"现价 {now:.2f}")
+        if chg is not None:
+            facts.append(f"累计 {chg:+.1f}%")
+        if days is not None and days >= due_days and not e.get("result"):
+            result = "看对了" if (chg or 0) > 0 else "看错了"
+            facts.append(f"到期机械对账（{due_days} 天）")
+        later = e.get("later") or (" · ".join(facts) if facts else "")
+        entries.append({
+            "code": code,
+            "name": e.get("name") or code,
+            "found": e.get("found") or "",
+            "price_found": pf if pf is not None else "",
+            "trigger": e.get("trigger") or "（未记录）",
+            "source": e.get("source") or "微信事实包",
+            "waiting": e.get("waiting") or "（未记录）",
+            "falsify": e.get("falsify") or "（未记录）",
+            "due": e.get("due") or _add_days(e.get("found"), due_days),
+            "result": result,
+            "later": later,
+        })
+    entries.sort(key=lambda x: str(x.get("found") or ""), reverse=True)
+    log(f"[*] 台账：{len(entries)} 条（未到期 {sum(1 for x in entries if x['result'] == '未到期')} 条）")
+    return {"v": 2, "updated": at, "entries": entries}
+
+
+def _add_days(found, days: int) -> str:
+    try:
+        return (date.fromisoformat(str(found)[:10]) + timedelta(days=days)).isoformat()
+    except Exception:
+        return ""
+
+
 def build_momentum(signals: dict[str, dict], cap: int = 300) -> dict:
     """按 RULES 生成异动榜分组。"""
     def item(code: str, s: dict) -> dict:
@@ -748,6 +832,9 @@ def fetch_all(client, out_dir: Path, args, now_cn, version: str, started: float,
                                                    "momentum": mom, "indices": items,
                                                    "stocks_ok": len(signals)})
         _write_json(stage / HISTORY, append_history(out_dir, at, px, signals, items, mom), indent=1)
+        led = build_ledger(out_dir, px, at)
+        if led:
+            _write_json(stage / LEDGER_OUT, led, indent=1)
         if items:
             _write_json(stage / "indices.json", {"updated": at, "items": items}, indent=1)
 
@@ -789,6 +876,9 @@ def merge_shards(shard_dir: Path, out_dir: Path, client, args, now_cn, version: 
                                                "momentum": mom, "indices": items,
                                                "stocks_ok": len(stocks)})
         _write_json(stage / HISTORY, append_history(out_dir, at, px, stocks, items, mom), indent=1)
+        led = build_ledger(out_dir, px, at)
+        if led:
+            _write_json(stage / LEDGER_OUT, led, indent=1)
     if items:
         _write_json(stage / "indices.json", {"updated": at, "items": items}, indent=1)
     if names:
