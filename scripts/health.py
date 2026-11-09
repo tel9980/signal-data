@@ -69,15 +69,34 @@ def in_trading() -> bool:
 
 
 def check_intraday() -> list[str]:
-    """盘中快照新鲜度：交易时段内 intraday/px.json 不应超过 40 分钟没更新。"""
-    if not in_trading():
-        print("  ℹ️  非交易时段，跳过盘中快照检查")
-        return []
+    """盘中快照新鲜度。
+
+    两条独立检查：
+      1. 非交易时段也查一遍「整条盘中分支是否死掉」——超过 26 小时没更新说明
+         盘中任务已经整天没成功（2026-11-09 真实发生过：分支停在前一天上午,
+         因为只在交易时段才检查，收盘后就没人发现）。
+      2. 交易时段内不应超过 40 分钟没更新。
+    """
     try:
         _, body = fetch("https://raw.githubusercontent.com/tel9980/signal-data/intraday/out/px.json")
         px = json.loads(body.decode("utf-8"))
-    except Exception as exc:
-        return [f"盘中快照读取失败：{type(exc).__name__}: {exc}"]
+        stamp_any = datetime.strptime(str(px.get("at", "")),
+                                     "%Y-%m-%d %H:%M").replace(tzinfo=TZ_CN)
+        dead_h = (datetime.now(TZ_CN) - stamp_any).total_seconds() / 3600
+        if dead_h > 26:
+            return [f"盘中快照已 {dead_h:.0f} 小时没更新（盘中任务可能整天没跑成功）"]
+    except Exception:
+        px = None   # 下面按交易时段再判一次，避免重复报错
+
+    if not in_trading():
+        print("  ℹ️  非交易时段，跳过盘中快照精细检查")
+        return []
+    if px is None:
+        try:
+            _, body = fetch("https://raw.githubusercontent.com/tel9980/signal-data/intraday/out/px.json")
+            px = json.loads(body.decode("utf-8"))
+        except Exception as exc:
+            return [f"盘中快照读取失败：{type(exc).__name__}: {exc}"]
     at = str(px.get("at", ""))
     try:
         stamp = datetime.strptime(at, "%Y-%m-%d %H:%M").replace(tzinfo=TZ_CN)
