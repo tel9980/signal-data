@@ -232,7 +232,8 @@ def close_issue_if_green() -> None:
         print(f"[health] 关闭 issue 失败：{type(exc).__name__}: {exc}")
 
 
-def kick_update(reason: str, workflow: str = "update.yml", quiet_window: int = 1200) -> None:
+def kick_update(reason: str, workflow: str = "update.yml", quiet_window: int = 1200,
+                inputs: dict | None = None) -> None:
     """自愈：数据明显落后且最近没有跑过，就手动触发一次对应 workflow。"""
     token = os.environ.get("GITHUB_TOKEN", "")
     repo = os.environ.get("GITHUB_REPOSITORY", "")
@@ -247,9 +248,11 @@ def kick_update(reason: str, workflow: str = "update.yml", quiet_window: int = 1
             if (now - started).total_seconds() < quiet_window:
                 print(f"[heal] {quiet_window // 60} 分钟内刚跑过 {run['id']}（{run['status']}），不重复触发")
                 return
-        gh_api(f"/repos/{repo}/actions/workflows/{workflow}/dispatches", token, "POST",
-               {"ref": "main"})
-        print(f"[heal] 已重新触发 {workflow} —— 原因：{reason}")
+        payload: dict = {"ref": "main"}
+        if inputs:
+            payload["inputs"] = inputs
+        gh_api(f"/repos/{repo}/actions/workflows/{workflow}/dispatches", token, "POST", payload)
+        print(f"[heal] 已重新触发 {workflow}{'（force）' if inputs else ''} —— 原因：{reason}")
     except Exception as exc:
         print(f"[heal] 触发失败：{type(exc).__name__}: {exc}")
 
@@ -263,7 +266,11 @@ def main() -> int:
             print(f"  - {b}")
         notify(bad)
         if any("盘中快照" in b for b in bad):
-            kick_update("；".join(b for b in bad if "盘中快照" in b), "intraday.yml", 600)
+            # 整条盘中分支死掉时（超过 26 小时没更新）不在交易时段也会被跳过守卫，
+            # 所以这种情形带 force 补一次，让分支立刻恢复；交易时段内则正常触发即可。
+            dead = any("小时没更新" in b for b in bad)
+            kick_update("；".join(b for b in bad if "盘中快照" in b), "intraday.yml", 600,
+                        {"force": "true"} if dead else None)
         if any("数据陈旧" in b or "数据时间戳异常" in b for b in bad):
             kick_update("；".join(b for b in bad if "陈旧" in b or "时间戳" in b))
         return 1
