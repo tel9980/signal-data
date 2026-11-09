@@ -94,6 +94,30 @@ def check_intraday() -> list[str]:
     return bad
 
 
+def check_regression() -> list[str]:
+    """数据不许往回退。
+
+    留档 history.json 是只追加的：它的最后一行就是"跑到过的最新一次"。
+    如果线上 px.json 的时间比它还早，说明数据被旧版本覆盖了（改代码时误把本地旧
+    out/ 一起提交，就会造成这种"看起来正常、其实是昨天数据"的事故）。
+    """
+    try:
+        _, body = fetch("https://raw.githubusercontent.com/tel9980/signal-data/main/out/px.json")
+        at_px = str(json.loads(body.decode("utf-8")).get("at") or "")
+        _, hbody = fetch("https://raw.githubusercontent.com/tel9980/signal-data/main/out/history.json")
+        rows = json.loads(hbody.decode("utf-8")).get("rows") or []
+    except Exception as exc:
+        return [f"回退检查失败：{type(exc).__name__}: {exc}"]
+    if not rows:
+        return []
+    at_hist = str(rows[-1].get("at") or "")
+    if at_px and at_hist and at_px < at_hist:
+        print(f"  ❌ 数据回退：px={at_px} 早于留档最新 {at_hist}")
+        return [f"数据被回退到更早的一版：px.json 是 {at_px}，但留档里已到过 {at_hist}（有旧 out/ 被提交了？）"]
+    print(f"  ✅ 没有回退（px {at_px} ≥ 留档 {at_hist}）")
+    return []
+
+
 def check_gate() -> list[str]:
     """闸门结论：stats.json 里 gate.ok=false 说明最近一轮被拦下了（数据没更新）。
 
@@ -213,7 +237,7 @@ def kick_update(reason: str, workflow: str = "update.yml", quiet_window: int = 1
 
 def main() -> int:
     print(f"=== 体检 {datetime.now(TZ_CN):%Y-%m-%d %H:%M} (北京时间) ===")
-    bad = check_http() + check_intraday() + check_freshness() + check_gate()
+    bad = check_http() + check_intraday() + check_freshness() + check_gate() + check_regression()
     if bad:
         print(f"\n== 失败 {len(bad)} 项 ==")
         for b in bad:
