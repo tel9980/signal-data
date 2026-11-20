@@ -68,18 +68,19 @@ eltdx（数据源，别人的库）  →  本仓库 pipeline.py  →  out/*.json
 | 主力大买 | 当日主力净流入 ≥ 5000 万元 |
 
 ## 稳定性设计
-| 合理性校验 | 闸门只能判断"够不够"，这里判断"对不对"：涨跌家数一侧为 0、平均涨幅单日跳变 >8 个百分点、异动榜数量放大 10 倍，一律拦下并写明原因 |
-| 上一版备份 | 发布前把旧文件 gzip 存到 `out/.prev/`；出问题 `bash scripts/rollback.sh` 拷回并提交，随时可再回退一次 |
 
 | 机制 | 说明 |
 |---|---|
 | **数据闸门** | 产出先写进 `out/.staging/`，只有「快照覆盖 ≥ 90% + 日 K ≥ 90% + 资金流 ≥ 50% + 指数 4/4」全部满足才 `os.replace` 原子发布；任何一项不达标 → 退出码 3、**线上保持上一份数据**，原因写进 `stats.json` |
 | **分片并行** | 工作流把 sz / sh / bj 拆成 3 个 job 跑在不同 runner（不同出口 IP），各抓自己市场，最后一个 job 合并。3 个分片合并结果与单次全量**逐字段一致（5575/5575）** |
-| **去重 + 补跑** | `scripts/should_run.py`：90 分钟内已有成功 run 就整轮跳过；配合 11:35 / 15:35 / 18:05 三个 cron，既不重复跑，也不怕 cron 延迟漏跑 |
+| **去重 + 补跑** | `scripts/should_run.py`：90 分钟内已有成功 run 就整轮跳过；配合 11:45 / 15:45 / 19:45 三个收盘时刻（由 CF 单 cron 分流），既不重复跑，也不怕调度延迟漏跑 |
 | **重试** | 单批请求失败（`PoolBusyError` / 瞬时断连）自动重试 3 次，指数退避 1s→2s |
 | **通道自愈** | 通达信偶发整条命令通道关闭（`ConnectionClosedError: 7709 runtime command channel is closed`）→ 检测到资金流大面积失败就**新建连接、拆成 60 只小批重试**，恢复后后续阶段改用新连接 |
 | **分片限流** | 三个分片会同时连同一个节点，所以分片内并发压到 `QUOTE_WORKERS=8 / DERIVE_WORKERS=6 / POOL_SIZE=16 / SERVER_COUNT=2`（都可环境变量覆盖） |
-| **线上体检** | `scripts/health.py` 每 30 分钟检查 8 项 + 数据新鲜度（工作日 16:00 后必须是当天数据），失败自动开 `health` 标签 issue，恢复后自动关闭 |
+| **合理性校验** | 闸门只判断"够不够"，`sanity_check()` 判断"对不对"：涨跌家数一侧为 0、平均涨幅单日跳变 >8 个百分点、异动榜数量放大 10 倍，一律拦下 |
+| **上一版备份** | 发布前把旧文件 gzip 存到 `out/.prev/`；出问题 `bash scripts/rollback.sh` 拷回并提交，随时可再回退一次 |
+| **线上体检** | `scripts/health.py` 每 30 分钟由 CF cron 触发，检查多项 HTTP + 数据新鲜度 + 闸门结论 + 数据回退，失败自动开 `health` 标签 issue 并尝试自愈，恢复后自动关闭 |
+| **触发器** | GitHub 免费 cron 实测基本不跑（盘中任务一天 0 次）→ 改由 Cloudflare Worker 的 cron 准点 POST `workflow_dispatch`（详见 `cf-worker/README.md`） |
 | **滚动提交** | 上一提交是 `chore: 行情数据更新` 时用 `--amend` 原地覆盖，仓库历史不膨胀 |
 
 ## 实测数据
@@ -92,7 +93,7 @@ eltdx（数据源，别人的库）  →  本仓库 pipeline.py  →  out/*.json
 | 与上游共有的代码 | 5570 只 |
 | 其中数值**完全一致** | **5564 只（99.89%）** |
 | 仅上游有、我们没有 | 602 只（主要是退市/长期停牌股，如 `000003`） |
-| 本机全量耗时 | **约 24–28 秒**（70 批快照 + 19 批日 K + 19 批资金流，10 线程并发） |
+| 本机全量耗时 | **约 23–28 秒**（70 批快照 + 19 批日 K + 19 批资金流，10 线程并发） |
 | Actions 耗时 | 见仓库 Actions 页面（分片并行后约 1 分钟量级） |
 | 四大指数 | 涨跌幅与 signal 完全一致（-1.10 / -3.96 / -2.60 / -2.37） |
 
@@ -147,9 +148,28 @@ python pipeline.py --out-dir /tmp/x # 指定输出目录
 
 ## 自动更新
 
-`.github/workflows/update.yml`：交易日 **北京时间 11:35 与 15:35** 各跑一次（cron 已换算成 UTC `35 3` / `35 7`），也可手动触发。
+`.github/workflows/update.yml`：交易日 **北京时间 11:45 / 15:45 / 19:45（补跑）** 各跑一次；盘中 `intraday.yml` 每 10 分钟只抓快照；体检 `health.yml` 每 30 分钟。
+
+**触发器已迁到 Cloudflare**：GitHub 自带 cron 实测基本不跑（盘中任务一天 0 次），所以由 `signal-proxy` Worker 用**单个 cron `*/5` 每 5 分钟触发一次**，`scheduled()` handler 按北京时间分流到对应 workflow（盘中/收盘/体检/节点）。免费档每账号 5 个 cron 名额，合并成 1 个最省。详见 `cf-worker/README.md`。也可在 Actions 页面手动触发。
 
 产物用**滚动提交**（`git commit --amend` 覆盖上一条），所以仓库历史永远是常量，不会像普通数据仓库那样每天膨胀。
+
+## 优化空间评估（2026-11-20 结论：已进入维护期）
+
+前三轮已把性能/稳定性/成本的大优化全部做完，实测**没有值得继续投入的技术优化**。核查过并主动放弃的方向：
+
+| 方向 | 结论 | 原因 |
+|---|---|---|
+| 五片细分矩阵 | 回滚 | 实测五片 7′42″ **反而慢于** 三市场 4′15″；瓶颈是通达信单节点容量，不是 CPU |
+| 逐股交叉校验（东方财富 push2 接口) | 放弃 | `push2/push2delay/82.push2` 全部 `RemoteDisconnected`；新源比它要防的故障更不稳，违背"少即是稳" |
+| 妙想(mx)技能进管线 | 放弃 | DSH 本地技能+凭据进不了 GitHub Actions；且东财口径与自建 eltdx 口径冲突，会让同一票两个价。定位为**仅人工复核时用** |
+| 再拆 `live.json` / 上 R2 / 数据库 / 自建服务器 | 放弃 | 首屏已用 44KB(gzip) 的 `live-core.json`；现全免费零运维，迁移只多一个要维护的东西 |
+| 台账 / K 线内容少 | 靠用不靠改 | 目前各 3 只；微信每问一只股票自动进台账、自动进 K 线页下拉 |
+
+**仍有效的常规维护**（非优化，已自动化）：每 30 分钟体检+自愈、每日 05:15 同步上游 data/ 与台账兜底、每轮发布前 gzip 备份 + 合理性校验、季度 git gc。
+**剩余人工事项**：令牌按平台策略周期性轮换（CF `GH_TOKEN`、GitHub fine-grained token）。
+
+全量体检 `bash check.sh`（沙箱需 `PATH=/tmp/bin:$PATH`）：**27/27 全绿**，覆盖上游 13 项 + 反代 10 项 + 台账/K线。
 
 ## 免责
 
@@ -159,9 +179,9 @@ eltdx 为 Research-Only 许可，本项目仅用于个人学习与协议研究�
 
 ```bash
 python -m pip install pytest
-python -m pytest -q tests        # 25 个用例，全程离线，不需要 eltdx
+python -m pytest -q tests        # 27 个用例，全程离线，不需要 eltdx
 ```
 
-CI 见 `.github/workflows/test.yml`：只改 `pipeline.py` / `tests/` / `scripts/` 时才触发，每天的数据滚动提交不会反复跑。
+CI 见 `.github/workflows/test.yml`：改 `pipeline.py` / `tests/` / `scripts/` / `out/**` 时触发；每次 push 先跑数据完整性自检（`scripts/check_data_integrity.py`，防误删/回退）再跑 pytest。
 锁住的是「改错就让线上出事」的那几块：数据闸门（覆盖率不足不许发布）、合理性校验、分片合并、异动榜规则、断线自愈、上一版备份、每日留档。
 
