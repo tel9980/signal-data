@@ -1,33 +1,33 @@
 {
- "updated": "2026-11-20 21:29",
+ "updated": "2026-11-28 03:25",
  "items": [
   {
    "name": "上证指数",
    "code": "sh000001",
-   "last": 3533.79,
-   "chg": -1.23,
-   "from_high": -17.0
+   "last": 3606.49,
+   "chg": 3.73,
+   "from_high": -15.3
   },
   {
    "name": "创业板指",
    "code": "sz399006",
-   "last": 2212.13,
-   "chg": -3.54,
-   "from_high": -49.5
+   "last": 2443.96,
+   "chg": 11.61,
+   "from_high": -44.2
   },
   {
    "name": "科创 50",
    "code": "sh000688",
-   "last": 1231.09,
-   "chg": -3.12,
-   "from_high": -45.4
+   "last": 1346.25,
+   "chg": 15.07,
+   "from_high": -40.3
   },
   {
    "name": "北证 50",
    "code": "bj899050",
-   "last": 759.9,
-   "chg": -4.85,
-   "from_high": -52.9
+   "last": 851.79,
+   "chg": 13.2,
+   "from_high": -47.2
   }
  ]
 }

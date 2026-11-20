@@ -1,33 +1,33 @@
 {
- "generated_at_utc": "2026-11-20T13:35:41+00:00",
+ "generated_at_utc": "2026-11-27T19:28:12+00:00",
  "eltdx_version": "3.3.5",
  "mode": "merge",
  "shards": 3,
- "at": "2026-11-20 21:29",
+ "at": "2026-11-28 03:25",
  "markets": [
   "bj",
   "sh",
   "sz"
  ],
- "universe": 5577,
- "quotes_ok": 5577,
- "signals_ok": 5577,
- "daily_ok": 5577,
- "flow_ok": 5216,
+ "universe": 5580,
+ "quotes_ok": 5580,
+ "signals_ok": 5580,
+ "daily_ok": 5580,
+ "flow_ok": 5219,
  "indices_ok": 4,
- "up": 313,
- "down": 5236,
- "flat": 28,
- "avg_chg": -4.75,
+ "up": 5382,
+ "down": 181,
+ "flat": 17,
+ "avg_chg": 7.31,
  "momentum": {
-  "季末拉升": 16,
-  "放量上攻": 33,
-  "创一年新高": 17,
-  "主力大买": 74
+  "季末拉升": 110,
+  "放量上攻": 252,
+  "创一年新高": 3,
+  "主力大买": 465
  },
  "gate": {
   "ok": true,
   "reason": "ok"
  },
- "duration_s": 19.5
+ "duration_s": 32.8
 }
