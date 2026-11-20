@@ -107,6 +107,11 @@ jobs:
       - name: Merge + gate + publish
         run: python pipeline.py --merge shard --out-dir out
 
+      # 可选增强：导出台账观察股的日 K（kline.html 用），失败不影响主管线
+      - name: 导出观察股日 K（可选）
+        continue-on-error: true
+        run: python scripts/export_kline.py --out-dir out --count 250
+
       - name: Commit (rolling)
         run: bash scripts/commit_data.sh
 
@@ -134,6 +139,10 @@ jobs:
 
       - name: 单机全量兜底
         run: python pipeline.py --out-dir out
+
+      - name: 导出观察股日 K（可选）
+        continue-on-error: true
+        run: python scripts/export_kline.py --out-dir out --count 250
 
       - name: Commit (rolling)
         run: bash scripts/commit_data.sh
